@@ -1,10 +1,14 @@
+import os
 import jwt
 from datetime import datetime, timedelta
 from fastapi import Security, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dotenv import load_dotenv
 
-SECRET_KEY = "orderdesk_super_secret_jwt_key_change_in_production"
-ALGORITHM = "HS256"
+load_dotenv()
+
+SECRET_KEY = os.getenv("SECRET_KEY", "orderdesk_super_secret_jwt_key_change_in_production")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
 security = HTTPBearer()
 
 
