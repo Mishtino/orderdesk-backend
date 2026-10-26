@@ -167,7 +167,7 @@ def whatsapp_order_webhook(
     demo_tenant_id = "123e4567-e89b-12d3-a456-426614174000"
 
     if not message_text.upper().startswith("ORDER"):
-        response_xml = """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+        response_xml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Message>Welcome to OrderDesk! To place a quick order, send: ORDER SKU-1001 10</Message>
 </Response>"""
@@ -210,7 +210,7 @@ def whatsapp_order_webhook(
     except ValueError:
         msg = "Format error: use ORDER SKU-1001 10"
 
-    response_xml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+    response_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Message>{msg}</Message>
 </Response>"""
