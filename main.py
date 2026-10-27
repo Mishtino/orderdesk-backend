@@ -47,6 +47,18 @@ class ProductModel(Base):
     weight_kg = Column(Float, default=2.0)
     volume_cbm = Column(Float, default=0.01)
 
+class CustomerModel(Base):
+    __tablename__ = "customers"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(String, nullable=False, index=True)
+    company_name = Column(String, nullable=False)
+    contact_email = Column(String, nullable=False)
+    phone_number = Column(String, nullable=True)
+    pricing_tier = Column(String, default="STANDARD")  # STANDARD, VIP, BULK_BUYER
+    discount_rate = Column(Float, default=0.0)         # Discount percentage e.g. 5.0 for 5%
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class OrderModel(Base):
     __tablename__ = "orders"
 
@@ -79,7 +91,7 @@ paynow = Paynow(
 )
 
 # --- FASTAPI APP ---
-app = FastAPI(title="OrderDesk B2B Engine", version="2.1.0")
+app = FastAPI(title="OrderDesk B2B Engine", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -99,21 +111,56 @@ class SubscribeRequest(BaseModel):
 class StatusUpdatePayload(BaseModel):
     status: str
 
+class CustomerCreatePayload(BaseModel):
+    company_name: str
+    contact_email: str
+    phone_number: Optional[str] = ""
+    pricing_tier: str = "STANDARD"
+    discount_rate: float = 0.0
+
 # --- SYSTEM & DATABASE ROUTES ---
 @app.post("/reset-db", tags=["System"])
 def reset_database():
     try:
         Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
-        return {"status": "success", "message": "Database reset cleanly with new reorder_level support."}
+        return {"status": "success", "message": "Database reset cleanly with Customer accounts support."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk B2B Engine v2.1"}
+    return {"status": "online", "system": "OrderDesk B2B Engine v2.2"}
 
-# --- PRODUCT & LOW STOCK ROUTES ---
+# --- CUSTOMER ACCOUNTS & PRICE LIST ROUTES ---
+@app.get("/customers", tags=["Customers"])
+def get_customers(db: Session = Depends(get_db)):
+    try:
+        customers = db.query(CustomerModel).filter(CustomerModel.organization_id == DEMO_TENANT_ID).all()
+        return {"data": customers}
+    except Exception:
+        return {"data": []}
+
+@app.post("/customers", tags=["Customers"])
+def create_customer(payload: CustomerCreatePayload, db: Session = Depends(get_db)):
+    try:
+        customer = CustomerModel(
+            organization_id=DEMO_TENANT_ID,
+            company_name=payload.company_name,
+            contact_email=payload.contact_email,
+            phone_number=payload.phone_number,
+            pricing_tier=payload.pricing_tier.upper(),
+            discount_rate=payload.discount_rate
+        )
+        db.add(customer)
+        db.commit()
+        db.refresh(customer)
+        return {"status": "success", "data": customer}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- PRODUCT ROUTES ---
 @app.get("/products", tags=["Products"])
 def get_products(db: Session = Depends(get_db)):
     try:
@@ -136,6 +183,7 @@ def get_low_stock_products(db: Session = Depends(get_db)):
 @app.post("/products/seed", tags=["Products"])
 def seed_demo_products(db: Session = Depends(get_db)):
     try:
+        # Seed Products
         default_items = [
             {"sku": "SKU-1001", "title": "Maize Meal 10kg", "wholesale_price": 12.50, "stock_quantity": 8, "reorder_level": 15, "weight_kg": 10.0},
             {"sku": "SKU-1002", "title": "Cooking Oil 2L", "wholesale_price": 3.80, "stock_quantity": 300, "reorder_level": 50, "weight_kg": 2.0},
@@ -148,8 +196,23 @@ def seed_demo_products(db: Session = Depends(get_db)):
             ).first()
             if not exists:
                 db.add(ProductModel(organization_id=DEMO_TENANT_ID, **item))
+
+        # Seed Sample Customers & Pricing Tiers
+        default_customers = [
+            {"company_name": "Harare Wholesalers Ltd", "contact_email": "orders@hararewholesale.co.zw", "phone_number": "+263771112233", "pricing_tier": "VIP", "discount_rate": 10.0},
+            {"company_name": "Ruwa Express Mart", "contact_email": "manager@ruwamart.co.zw", "phone_number": "+263713044018", "pricing_tier": "BULK_BUYER", "discount_rate": 5.0},
+            {"company_name": "Chitungwiza Retailers", "contact_email": "sales@chitownretail.co.zw", "phone_number": "+263789998877", "pricing_tier": "STANDARD", "discount_rate": 0.0},
+        ]
+        for cust in default_customers:
+            exists = db.query(CustomerModel).filter(
+                CustomerModel.organization_id == DEMO_TENANT_ID,
+                CustomerModel.company_name == cust["company_name"]
+            ).first()
+            if not exists:
+                db.add(CustomerModel(organization_id=DEMO_TENANT_ID, **cust))
+
         db.commit()
-        return {"status": "seeded", "message": "Demo catalog initialized with reorder triggers."}
+        return {"status": "seeded", "message": "Demo products and customer accounts initialized."}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Seed error: {str(e)}")
