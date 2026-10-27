@@ -55,16 +55,18 @@ class CustomerModel(Base):
     company_name = Column(String, nullable=False)
     contact_email = Column(String, nullable=False)
     phone_number = Column(String, nullable=True)
-    pricing_tier = Column(String, default="STANDARD")  # STANDARD, VIP, BULK_BUYER
-    discount_rate = Column(Float, default=0.0)         # Discount percentage e.g. 5.0 for 5%
+    pricing_tier = Column(String, default="STANDARD")
+    discount_rate = Column(Float, default=0.0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class OrderModel(Base):
     __tablename__ = "orders"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    invoice_number = Column(String, nullable=False, default=lambda: f"INV-{uuid.uuid4().hex[:6].upper()}")
     organization_id = Column(String, nullable=False, index=True)
     client_name = Column(String, nullable=False)
+    client_email = Column(String, default="client@orderdesk.co.zw")
     fulfillment_type = Column(String, default="PICKUP")
     delivery_city = Column(String, nullable=True)
     item_subtotal = Column(Float, nullable=False)
@@ -91,7 +93,7 @@ paynow = Paynow(
 )
 
 # --- FASTAPI APP ---
-app = FastAPI(title="OrderDesk B2B Engine", version="2.2.0")
+app = FastAPI(title="OrderDesk B2B Engine", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -124,15 +126,15 @@ def reset_database():
     try:
         Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
-        return {"status": "success", "message": "Database reset cleanly with Customer accounts support."}
+        return {"status": "success", "message": "Database reset cleanly with Invoice and PDF support."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk B2B Engine v2.2"}
+    return {"status": "online", "system": "OrderDesk B2B Engine v2.3"}
 
-# --- CUSTOMER ACCOUNTS & PRICE LIST ROUTES ---
+# --- CUSTOMER ACCOUNTS ---
 @app.get("/customers", tags=["Customers"])
 def get_customers(db: Session = Depends(get_db)):
     try:
@@ -197,7 +199,7 @@ def seed_demo_products(db: Session = Depends(get_db)):
             if not exists:
                 db.add(ProductModel(organization_id=DEMO_TENANT_ID, **item))
 
-        # Seed Sample Customers & Pricing Tiers
+        # Seed Customers
         default_customers = [
             {"company_name": "Harare Wholesalers Ltd", "contact_email": "orders@hararewholesale.co.zw", "phone_number": "+263771112233", "pricing_tier": "VIP", "discount_rate": 10.0},
             {"company_name": "Ruwa Express Mart", "contact_email": "manager@ruwamart.co.zw", "phone_number": "+263713044018", "pricing_tier": "BULK_BUYER", "discount_rate": 5.0},
@@ -211,8 +213,43 @@ def seed_demo_products(db: Session = Depends(get_db)):
             if not exists:
                 db.add(CustomerModel(organization_id=DEMO_TENANT_ID, **cust))
 
+        # Seed Initial Wholesale Orders for Testing
+        default_orders = [
+            {
+                "invoice_number": "INV-109012",
+                "client_name": "Harare Wholesalers Ltd",
+                "client_email": "orders@hararewholesale.co.zw",
+                "fulfillment_type": "INTERCITY_FREIGHT",
+                "delivery_city": "Bulawayo",
+                "item_subtotal": 450.00,
+                "shipping_fee": 35.00,
+                "total_amount": 485.00,
+                "status": "CONFIRMED",
+                "payment_status": "PAID"
+            },
+            {
+                "invoice_number": "INV-109013",
+                "client_name": "Ruwa Express Mart",
+                "client_email": "manager@ruwamart.co.zw",
+                "fulfillment_type": "LOCAL_BIKER",
+                "delivery_city": "Ruwa",
+                "item_subtotal": 120.00,
+                "shipping_fee": 5.00,
+                "total_amount": 125.00,
+                "status": "PENDING",
+                "payment_status": "UNPAID"
+            }
+        ]
+        for ord_data in default_orders:
+            exists = db.query(OrderModel).filter(
+                OrderModel.organization_id == DEMO_TENANT_ID,
+                OrderModel.invoice_number == ord_data["invoice_number"]
+            ).first()
+            if not exists:
+                db.add(OrderModel(organization_id=DEMO_TENANT_ID, **ord_data))
+
         db.commit()
-        return {"status": "seeded", "message": "Demo products and customer accounts initialized."}
+        return {"status": "seeded", "message": "Demo products, customers, and wholesale invoices initialized."}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Seed error: {str(e)}")
@@ -264,7 +301,7 @@ def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get
         db.rollback()
         raise HTTPException(status_code=500, detail=f"CSV processing error: {str(e)}")
 
-# --- ORDERS & PIPELINE ROUTES ---
+# --- ORDERS & INVOICES ROUTES ---
 @app.get("/orders", tags=["Orders"])
 def get_orders(db: Session = Depends(get_db)):
     try:
