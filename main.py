@@ -3,9 +3,9 @@ import uuid
 import csv
 import io
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Form, Response, UploadFile, File, status
+from fastapi import FastAPI, Depends, HTTPException, Form, Response, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, ForeignKey
@@ -19,7 +19,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./orderdesk.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
+engine = create_engine(
+    DATABASE_URL, 
+    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -69,21 +72,9 @@ class OrderModel(Base):
     payment_status = Column(String, default="UNPAID")
     created_at = Column(DateTime, default=datetime.utcnow)
 
-class SubscriptionPaymentModel(Base):
-    __tablename__ = "subscription_payments"
-
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    organization_id = Column(String, ForeignKey("organizations.id"), nullable=False)
-    amount = Column(Float, nullable=False)
-    plan_type = Column(String, nullable=False)
-    paynow_poll_url = Column(String, nullable=True)
-    paynow_reference = Column(String, nullable=True)
-    status = Column(String, default="PENDING")
-    created_at = Column(DateTime, default=datetime.utcnow)
-
 Base.metadata.create_all(bind=engine)
 
-# --- FASTAPI APP DECLARATION (REQUIRED BY UVICORN) ---
+# --- FASTAPI APP DECLARATION ---
 app = FastAPI(title="OrderDesk B2B Engine", version="2.0.0")
 
 app.add_middleware(
@@ -94,7 +85,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- LOGISTICS ENGINE LOGIC ---
+DEMO_TENANT_ID = "123e4567-e89b-12d3-a456-426614174000"
+
 def calculate_fulfillment_cost(fulfillment_type: str, destination_city: str, total_weight_kg: float):
     if fulfillment_type.upper() == "PICKUP":
         return 0.00, "CUSTOMER_PICKUP", "Warehouse Pick Up (Free)"
@@ -123,41 +115,30 @@ def calculate_fulfillment_cost(fulfillment_type: str, destination_city: str, tot
         details = f"Aisle Logistics Freight ({vehicle_type} - {total_weight_kg:.1f} kg)"
         return shipping_fee, vehicle_type, details
 
-# --- SCHEMAS ---
-class ProductCreate(BaseModel):
-    sku: str
-    title: str
-    wholesale_price: float
-    stock_quantity: int
-    weight_kg: Optional[float] = 2.0
-
-class SubscriptionRequest(BaseModel):
-    plan_type: str
-    organization_id: str
-    user_email: str
-
 # --- PRODUCT & ORDER ENDPOINTS ---
 @app.get("/products", tags=["Products"])
 def get_products(db: Session = Depends(get_db)):
-    demo_tenant_id = "123e4567-e89b-12d3-a456-426614174000"
-    products = db.query(ProductModel).filter(ProductModel.organization_id == demo_tenant_id).all()
+    products = db.query(ProductModel).filter(ProductModel.organization_id == DEMO_TENANT_ID).all()
     return {"data": products}
 
-@app.post("/products", tags=["Products"])
-def create_product(product: ProductCreate, db: Session = Depends(get_db)):
-    demo_tenant_id = "123e4567-e89b-12d3-a456-426614174000"
-    db_prod = ProductModel(organization_id=demo_tenant_id, **product.dict())
-    db.add(db_prod)
+@app.post("/products/seed", tags=["Products"])
+def seed_demo_products(db: Session = Depends(get_db)):
+    default_items = [
+        {"sku": "SKU-1001", "title": "Maize Meal 10kg", "wholesale_price": 12.50, "stock_quantity": 150, "weight_kg": 10.0},
+        {"sku": "SKU-1002", "title": "Cooking Oil 2L", "wholesale_price": 3.80, "stock_quantity": 300, "weight_kg": 2.0},
+        {"sku": "SKU-1003", "title": "Refined Sugar 2kg", "wholesale_price": 2.40, "stock_quantity": 200, "weight_kg": 2.0},
+    ]
+    for item in default_items:
+        exists = db.query(ProductModel).filter(ProductModel.organization_id == DEMO_TENANT_ID, ProductModel.sku == item["sku"]).first()
+        if not exists:
+            db.add(ProductModel(organization_id=DEMO_TENANT_ID, **item))
     db.commit()
-    db.refresh(db_prod)
-    return {"message": "Product registered successfully", "data": db_prod}
+    return {"status": "seeded"}
 
 @app.post("/products/bulk-upload", tags=["Products"])
 def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get_db)):
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="File must be a valid .csv spreadsheet.")
-
-    demo_tenant_id = "123e4567-e89b-12d3-a456-426614174000"
 
     try:
         content = file.file.read().decode("utf-8")
@@ -175,7 +156,7 @@ def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get
                 continue
 
             existing_prod = db.query(ProductModel).filter(
-                ProductModel.organization_id == demo_tenant_id,
+                ProductModel.organization_id == DEMO_TENANT_ID,
                 ProductModel.sku == sku
             ).first()
 
@@ -185,15 +166,14 @@ def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get
                 existing_prod.stock_quantity = stock
                 existing_prod.weight_kg = weight
             else:
-                new_prod = ProductModel(
-                    organization_id=demo_tenant_id,
+                db.add(ProductModel(
+                    organization_id=DEMO_TENANT_ID,
                     sku=sku,
                     title=title,
                     wholesale_price=price,
                     stock_quantity=stock,
                     weight_kg=weight
-                )
-                db.add(new_prod)
+                ))
 
             processed_count += 1
 
@@ -205,34 +185,47 @@ def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get
 
 @app.get("/orders", tags=["Orders"])
 def get_orders(db: Session = Depends(get_db)):
-    demo_tenant_id = "123e4567-e89b-12d3-a456-426614174000"
-    orders = db.query(OrderModel).filter(OrderModel.organization_id == demo_tenant_id).all()
+    orders = db.query(OrderModel).filter(OrderModel.organization_id == DEMO_TENANT_ID).all()
     return {"data": orders}
 
-# --- MESSAGING WEBHOOK ---
-@app.post("/webhooks/sms", tags=["Webhooks"])
-@app.post("/webhooks/whatsapp", tags=["Webhooks"])
-def messaging_order_webhook(From: str = Form(...), Body: str = Form(...), db: Session = Depends(get_db)):
-    raw_text = Body.strip()
-    message_text = raw_text.upper()
+# --- TWILIO / MESSAGING WEBHOOK ---
+@app.api_route("/webhooks/sms", methods=["GET", "POST"], tags=["Webhooks"])
+@app.api_route("/webhooks/whatsapp", methods=["GET", "POST"], tags=["Webhooks"])
+async def messaging_order_webhook(request: Request, db: Session = Depends(get_db)):
+    form_data = await request.form()
+    sender = form_data.get("From", "Customer")
+    raw_body = form_data.get("Body", "").strip()
+    message_text = raw_body.upper()
     parts = message_text.split()
     cmd = parts[0] if parts else ""
-    demo_tenant_id = "123e4567-e89b-12d3-a456-426614174000"
 
     if cmd in ["CATALOG", "ITEMS", "MENU", "PRODUCTS"]:
         products = db.query(ProductModel).filter(
-            ProductModel.organization_id == demo_tenant_id,
+            ProductModel.organization_id == DEMO_TENANT_ID,
             ProductModel.stock_quantity > 0
         ).all()
 
         if not products:
-            msg = "Catalog is currently empty."
+            msg = "Catalog is empty. Reply SEED to generate sample products."
         else:
             catalog_lines = ["--- ORDERDESK CATALOG ---"]
             for p in products:
                 catalog_lines.append(f"• {p.sku}: {p.title}\n  Price: ${p.wholesale_price:.2f} | Stock: {p.stock_quantity}")
-            catalog_lines.append("\nOrder command:\nORDER <SKU> <QTY> PICKUP\nOR\nORDER <SKU> <QTY> DELIVER TO <CITY>")
+            catalog_lines.append("\nTo Order:\nORDER <SKU> <QTY> PICKUP\nOR\nORDER <SKU> <QTY> DELIVER TO <CITY>")
             msg = "\n".join(catalog_lines)
+
+    elif cmd == "SEED":
+        default_items = [
+            {"sku": "SKU-1001", "title": "Maize Meal 10kg", "wholesale_price": 12.50, "stock_quantity": 150, "weight_kg": 10.0},
+            {"sku": "SKU-1002", "title": "Cooking Oil 2L", "wholesale_price": 3.80, "stock_quantity": 300, "weight_kg": 2.0},
+            {"sku": "SKU-1003", "title": "Refined Sugar 2kg", "wholesale_price": 2.40, "stock_quantity": 200, "weight_kg": 2.0},
+        ]
+        for item in default_items:
+            exists = db.query(ProductModel).filter(ProductModel.organization_id == DEMO_TENANT_ID, ProductModel.sku == item["sku"]).first()
+            if not exists:
+                db.add(ProductModel(organization_id=DEMO_TENANT_ID, **item))
+        db.commit()
+        msg = "Demo products added! Reply CATALOG to view inventory."
 
     elif cmd == "ORDER":
         try:
@@ -255,12 +248,12 @@ def messaging_order_webhook(From: str = Form(...), Body: str = Form(...), db: Se
             quantity = int(args_parts[1])
 
             product = db.query(ProductModel).filter(
-                ProductModel.organization_id == demo_tenant_id,
+                ProductModel.organization_id == DEMO_TENANT_ID,
                 ProductModel.sku == sku
             ).first()
 
             if not product or product.stock_quantity < quantity:
-                msg = f"Error: Item out of stock or SKU '{sku}' not found."
+                msg = f"Error: SKU '{sku}' unavailable or insufficient stock."
             else:
                 item_subtotal = product.wholesale_price * quantity
                 total_weight = (product.weight_kg or 2.0) * quantity
@@ -271,8 +264,8 @@ def messaging_order_webhook(From: str = Form(...), Body: str = Form(...), db: Se
                 grand_total = item_subtotal + shipping_fee
 
                 db_order = OrderModel(
-                    organization_id=demo_tenant_id,
-                    client_name=From,
+                    organization_id=DEMO_TENANT_ID,
+                    client_name=sender,
                     fulfillment_type=fulfillment_type,
                     delivery_city=destination_city.title() if fulfillment_type == "DELIVERY" else "N/A (Pick Up)",
                     item_subtotal=item_subtotal,
@@ -286,51 +279,14 @@ def messaging_order_webhook(From: str = Form(...), Body: str = Form(...), db: Se
                 product.stock_quantity -= quantity
                 db.commit()
 
-                msg = f"Order #{db_order.id[:8]} confirmed. Total: ${grand_total:.2f}. Fulfillment: {shipping_details}"
+                msg = f"Order #{db_order.id[:8]} placed! Total: ${grand_total:.2f}. {shipping_details}"
         except Exception:
-            msg = "Format error: ORDER <SKU> <QTY> PICKUP or DELIVER TO <CITY>"
+            msg = "Format error: Reply CATALOG or use 'ORDER <SKU> <QTY> PICKUP'"
     else:
-        msg = "Welcome to OrderDesk! Reply CATALOG to view available inventory."
+        msg = "Welcome to OrderDesk! Reply CATALOG to view items or SEED to add sample inventory."
 
-    response_xml = f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>{msg}</Message></Response>"
-    return Response(content=response_xml, media_type="application/xml")
-
-# --- PAYNOW SUBSCRIPTION ENDPOINTS ---
-PLAN_PRICES = {"MONTHLY": 29.99, "YEARLY": 299.00}
-
-@app.post("/saas/subscribe", tags=["SaaS Subscriptions"])
-def initiate_saas_subscription(req: SubscriptionRequest, db: Session = Depends(get_db)):
-    if req.plan_type not in PLAN_PRICES:
-        raise HTTPException(status_code=400, detail="Invalid plan type")
-
-    paynow_id = os.getenv("PAYNOW_INTEGRATION_ID", "24744")
-    paynow_key = os.getenv("PAYNOW_INTEGRATION_KEY", "a643f3fb-5957-4c6d-a36e-10f431451b3e")
-    amount = PLAN_PRICES[req.plan_type]
-
-    paynow = Paynow(
-        paynow_id,
-        paynow_key,
-        "https://orderdesk-ui-ag2t.vercel.app/billing/return",
-        "https://orderdesk-backend-9gu2.onrender.com/webhooks/paynow/saas"
-    )
-
-    payment = paynow.create_payment(f"OrderDesk {req.plan_type} Subscription", req.user_email)
-    payment.add(f"OrderDesk Access ({req.plan_type})", amount)
-    response = paynow.send(payment)
-
-    if response.success:
-        sub_record = SubscriptionPaymentModel(
-            organization_id=req.organization_id,
-            amount=amount,
-            plan_type=req.plan_type,
-            paynow_poll_url=response.poll_url,
-            status="PENDING"
-        )
-        db.add(sub_record)
-        db.commit()
-        return {"status": "success", "redirect_url": response.redirect_url, "poll_url": response.poll_url}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to initialize Paynow transaction")
+    twiml_xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{msg}</Message></Response>'
+    return Response(content=twiml_xml, media_type="application/xml")
 
 @app.get("/", tags=["Health"])
 def health_check():
