@@ -75,12 +75,22 @@ app.add_middleware(
 
 DEMO_TENANT_ID = "123e4567-e89b-12d3-a456-426614174000"
 
+@app.post("/reset-db", tags=["System"])
+def reset_database():
+    """Drops and recreates all tables to fix schema mismatch issues."""
+    try:
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+        return {"status": "success", "message": "Database tables recreated with fresh schema."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/products", tags=["Products"])
 def get_products(db: Session = Depends(get_db)):
     try:
         products = db.query(ProductModel).filter(ProductModel.organization_id == DEMO_TENANT_ID).all()
         return {"data": products}
-    except Exception as e:
+    except Exception:
         return {"data": []}
 
 @app.post("/products/seed", tags=["Products"])
@@ -102,7 +112,7 @@ def seed_demo_products(db: Session = Depends(get_db)):
         return {"status": "seeded", "message": "Demo catalog initialized successfully."}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Seed error: {str(e)}")
 
 @app.post("/products/bulk-upload", tags=["Products"])
 def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get_db)):
@@ -122,4 +132,40 @@ def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get
             weight = float(row.get("weight_kg", 2.0))
 
             existing_prod = db.query(ProductModel).filter(
-                ProductModel.
+                ProductModel.organization_id == DEMO_TENANT_ID,
+                ProductModel.sku == sku
+            ).first()
+
+            if existing_prod:
+                existing_prod.title = title
+                existing_prod.wholesale_price = price
+                existing_prod.stock_quantity = stock
+                existing_prod.weight_kg = weight
+            else:
+                db.add(ProductModel(
+                    organization_id=DEMO_TENANT_ID,
+                    sku=sku,
+                    title=title,
+                    wholesale_price=price,
+                    stock_quantity=stock,
+                    weight_kg=weight
+                ))
+            processed_count += 1
+
+        db.commit()
+        return {"status": "success", "message": f"Successfully imported {processed_count} SKUs."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"CSV processing error: {str(e)}")
+
+@app.get("/orders", tags=["Orders"])
+def get_orders(db: Session = Depends(get_db)):
+    try:
+        orders = db.query(OrderModel).filter(OrderModel.organization_id == DEMO_TENANT_ID).all()
+        return {"data": orders}
+    except Exception:
+        return {"data": []}
+
+@app.get("/", tags=["Health"])
+def health_check():
+    return {"status": "online", "system": "OrderDesk B2B Engine v2.0"}
