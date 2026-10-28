@@ -112,7 +112,7 @@ class SettingsModel(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# --- PAYNOW LIVE CONFIGURATION ---
+# --- PAYNOW CONFIGURATION ---
 PAYNOW_INTEGRATION_ID = os.getenv("PAYNOW_INTEGRATION_ID", "12345")
 PAYNOW_INTEGRATION_KEY = os.getenv("PAYNOW_INTEGRATION_KEY", "sandbox-key")
 RESULT_URL = os.getenv("PAYNOW_RESULT_URL", "https://orderdesk-backend-9gu2.onrender.com/webhooks/paynow")
@@ -125,8 +125,8 @@ paynow = Paynow(
     RETURN_URL
 )
 
-# --- FASTAPI APP ---
-app = FastAPI(title="OrderDesk B2B Production Engine", version="5.0.0")
+# --- FASTAPI APP & CORS ---
+app = FastAPI(title="OrderDesk B2B Engine", version="5.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -137,19 +137,19 @@ app.add_middleware(
 )
 
 @app.middleware("http")
-async def add_security_headers(request: Request, call_next):
+async def cors_and_security_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         response = Response(status_code=200)
         response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "*"
-        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
         return response
 
     response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     return response
 
 # --- SCHEMAS ---
@@ -285,7 +285,7 @@ def reset_database():
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk B2B Passkey Engine v5.0"}
+    return {"status": "online", "system": "OrderDesk B2B Passkey Engine v5.1"}
 
 @app.get("/settings/rate", tags=["Settings"])
 def get_exchange_rate(org_id: str = "default", db: Session = Depends(get_db)):
