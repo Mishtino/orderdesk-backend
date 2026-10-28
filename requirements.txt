@@ -5,4 +5,4 @@ pydantic
 email-validator
 paynow
 python-multipart
-psycopg2-binarypsycopg2-binary
+psycopg2-binary
