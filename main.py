@@ -7,7 +7,7 @@ from typing import Optional, List
 
 from fastapi import FastAPI, Depends, HTTPException, Form, Response, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -83,7 +83,7 @@ class SettingsModel(Base):
     __tablename__ = "settings"
 
     organization_id = Column(String, primary_key=True)
-    zig_exchange_rate = Column(Float, default=26.50)  # 1 USD = 26.50 ZiG
+    zig_exchange_rate = Column(Float, default=26.50)
 
 Base.metadata.create_all(bind=engine)
 
@@ -100,8 +100,8 @@ paynow = Paynow(
     RETURN_URL
 )
 
-# --- FASTAPI APP ---
-app = FastAPI(title="OrderDesk B2B Engine", version="2.7.0")
+# --- FASTAPI APP & SECURITY MIDDLEWARE ---
+app = FastAPI(title="OrderDesk B2B Secure Engine", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -111,32 +111,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
 DEMO_TENANT_ID = "123e4567-e89b-12d3-a456-426614174000"
 
-# --- PYDANTIC SCHEMAS ---
+# --- SANITIZED PYDANTIC SCHEMAS ---
 class SubscribeRequest(BaseModel):
-    plan_tier: str
-    email: str
+    plan_tier: str = Field(..., max_length=50)
+    email: str = Field(..., max_length=120)
 
 class StatusUpdatePayload(BaseModel):
-    status: str
+    status: str = Field(..., max_length=30)
 
 class CustomerCreatePayload(BaseModel):
-    company_name: str
-    contact_email: str
-    phone_number: Optional[str] = ""
-    pricing_tier: str = "STANDARD"
-    discount_rate: float = 0.0
+    company_name: str = Field(..., max_length=150)
+    contact_email: str = Field(..., max_length=120)
+    phone_number: Optional[str] = Field("", max_length=50)
+    pricing_tier: str = Field("STANDARD", max_length=30)
+    discount_rate: float = Field(0.0, ge=0.0, le=100.0)
 
 class CustomerUpdatePayload(BaseModel):
-    company_name: Optional[str] = None
-    contact_email: Optional[str] = None
-    phone_number: Optional[str] = None
-    pricing_tier: Optional[str] = None
-    discount_rate: Optional[float] = None
+    company_name: Optional[str] = Field(None, max_length=150)
+    contact_email: Optional[str] = Field(None, max_length=120)
+    phone_number: Optional[str] = Field(None, max_length=50)
+    pricing_tier: Optional[str] = Field(None, max_length=30)
+    discount_rate: Optional[float] = Field(None, ge=0.0, le=100.0)
 
 class RateUpdatePayload(BaseModel):
-    zig_exchange_rate: float
+    zig_exchange_rate: float = Field(..., gt=0.0)
 
 # --- HELPER: UNIVERSAL CSV COLUMN RESOLVER ---
 def extract_column_value(row: dict, candidates: List[str], default_val: str = "") -> str:
@@ -147,7 +156,7 @@ def extract_column_value(row: dict, candidates: List[str], default_val: str = ""
             return normalized_row[clean_cand]
     return default_val
 
-# --- SYSTEM & SETTINGS ---
+# --- SYSTEM & HEALTH ---
 @app.post("/reset-db", tags=["System"])
 def reset_database():
     try:
@@ -159,7 +168,7 @@ def reset_database():
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk B2B Engine v2.7"}
+    return {"status": "online", "system": "OrderDesk B2B Engine v3.0 (Secured)"}
 
 @app.get("/settings/rate", tags=["Settings"])
 def get_exchange_rate(db: Session = Depends(get_db)):
@@ -196,9 +205,9 @@ def create_customer(payload: CustomerCreatePayload, db: Session = Depends(get_db
     try:
         customer = CustomerModel(
             organization_id=DEMO_TENANT_ID,
-            company_name=payload.company_name,
-            contact_email=payload.contact_email,
-            phone_number=payload.phone_number,
+            company_name=payload.company_name.strip(),
+            contact_email=payload.contact_email.strip().lower(),
+            phone_number=payload.phone_number.strip(),
             pricing_tier=payload.pricing_tier.upper(),
             discount_rate=payload.discount_rate
         )
@@ -216,9 +225,9 @@ def update_customer(customer_id: str, payload: CustomerUpdatePayload, db: Sessio
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
     
-    if payload.company_name: customer.company_name = payload.company_name
-    if payload.contact_email: customer.contact_email = payload.contact_email
-    if payload.phone_number is not None: customer.phone_number = payload.phone_number
+    if payload.company_name: customer.company_name = payload.company_name.strip()
+    if payload.contact_email: customer.contact_email = payload.contact_email.strip().lower()
+    if payload.phone_number is not None: customer.phone_number = payload.phone_number.strip()
     if payload.pricing_tier: customer.pricing_tier = payload.pricing_tier.upper()
     if payload.discount_rate is not None: customer.discount_rate = payload.discount_rate
 
@@ -236,7 +245,7 @@ def delete_customer(customer_id: str, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "success", "message": "Customer deleted successfully"}
 
-# --- PRODUCT & UNIVERSAL CSV UPLOADER ---
+# --- PRODUCT & CSV UPLOADER ---
 @app.get("/products", tags=["Products"])
 def get_products(db: Session = Depends(get_db)):
     try:
@@ -260,9 +269,9 @@ async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depen
             if not sku_raw or not title_raw:
                 continue
 
-            sku = sku_raw.upper()
-            title = title_raw
-            category = extract_column_value(row, ["category", "cat", "group", "type"], "General")
+            sku = sku_raw.upper().strip()
+            title = title_raw.strip()
+            category = extract_column_value(row, ["category", "cat", "group", "type"], "General").strip()
 
             price_str = extract_column_value(row, ["unitprice", "wholesaleprice", "price", "unitcost", "cost", "rate", "amount"], "0.0")
             stock_str = extract_column_value(row, ["quantity", "stockquantity", "stock", "qty", "count", "available", "units"], "0")
