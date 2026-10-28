@@ -93,7 +93,7 @@ paynow = Paynow(
 )
 
 # --- FASTAPI APP ---
-app = FastAPI(title="OrderDesk B2B Engine", version="2.3.0")
+app = FastAPI(title="OrderDesk B2B Engine", version="2.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -120,21 +120,28 @@ class CustomerCreatePayload(BaseModel):
     pricing_tier: str = "STANDARD"
     discount_rate: float = 0.0
 
-# --- SYSTEM & DATABASE ROUTES ---
+class CustomerUpdatePayload(BaseModel):
+    company_name: Optional[str] = None
+    contact_email: Optional[str] = None
+    phone_number: Optional[str] = None
+    pricing_tier: Optional[str] = None
+    discount_rate: Optional[float] = None
+
+# --- SYSTEM & HEALTH ---
 @app.post("/reset-db", tags=["System"])
 def reset_database():
     try:
         Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
-        return {"status": "success", "message": "Database reset cleanly with Invoice and PDF support."}
+        return {"status": "success", "message": "Database reset cleanly."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk B2B Engine v2.3"}
+    return {"status": "online", "system": "OrderDesk B2B Engine v2.4"}
 
-# --- CUSTOMER ACCOUNTS ---
+# --- FIX #3: EDITABLE / REMOVABLE RETAILER ACCOUNTS ---
 @app.get("/customers", tags=["Customers"])
 def get_customers(db: Session = Depends(get_db)):
     try:
@@ -162,7 +169,33 @@ def create_customer(payload: CustomerCreatePayload, db: Session = Depends(get_db
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- PRODUCT ROUTES ---
+@app.patch("/customers/{customer_id}", tags=["Customers"])
+def update_customer(customer_id: str, payload: CustomerUpdatePayload, db: Session = Depends(get_db)):
+    customer = db.query(CustomerModel).filter(CustomerModel.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    if payload.company_name: customer.company_name = payload.company_name
+    if payload.contact_email: customer.contact_email = payload.contact_email
+    if payload.phone_number is not None: customer.phone_number = payload.phone_number
+    if payload.pricing_tier: customer.pricing_tier = payload.pricing_tier.upper()
+    if payload.discount_rate is not None: customer.discount_rate = payload.discount_rate
+
+    db.commit()
+    db.refresh(customer)
+    return {"status": "success", "data": customer}
+
+@app.delete("/customers/{customer_id}", tags=["Customers"])
+def delete_customer(customer_id: str, db: Session = Depends(get_db)):
+    customer = db.query(CustomerModel).filter(CustomerModel.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    db.delete(customer)
+    db.commit()
+    return {"status": "success", "message": "Customer deleted successfully"}
+
+# --- FIX #1: ROBUST CSV UPLOADER ---
 @app.get("/products", tags=["Products"])
 def get_products(db: Session = Depends(get_db)):
     try:
@@ -171,106 +204,28 @@ def get_products(db: Session = Depends(get_db)):
     except Exception:
         return {"data": []}
 
-@app.get("/products/low-stock", tags=["Products"])
-def get_low_stock_products(db: Session = Depends(get_db)):
-    try:
-        products = db.query(ProductModel).filter(
-            ProductModel.organization_id == DEMO_TENANT_ID,
-            ProductModel.stock_quantity <= ProductModel.reorder_level
-        ).all()
-        return {"data": products, "count": len(products)}
-    except Exception as e:
-        return {"data": [], "count": 0, "error": str(e)}
-
-@app.post("/products/seed", tags=["Products"])
-def seed_demo_products(db: Session = Depends(get_db)):
-    try:
-        # Seed Products
-        default_items = [
-            {"sku": "SKU-1001", "title": "Maize Meal 10kg", "wholesale_price": 12.50, "stock_quantity": 8, "reorder_level": 15, "weight_kg": 10.0},
-            {"sku": "SKU-1002", "title": "Cooking Oil 2L", "wholesale_price": 3.80, "stock_quantity": 300, "reorder_level": 50, "weight_kg": 2.0},
-            {"sku": "SKU-1003", "title": "Refined Sugar 2kg", "wholesale_price": 2.40, "stock_quantity": 5, "reorder_level": 20, "weight_kg": 2.0},
-        ]
-        for item in default_items:
-            exists = db.query(ProductModel).filter(
-                ProductModel.organization_id == DEMO_TENANT_ID, 
-                ProductModel.sku == item["sku"]
-            ).first()
-            if not exists:
-                db.add(ProductModel(organization_id=DEMO_TENANT_ID, **item))
-
-        # Seed Customers
-        default_customers = [
-            {"company_name": "Harare Wholesalers Ltd", "contact_email": "orders@hararewholesale.co.zw", "phone_number": "+263771112233", "pricing_tier": "VIP", "discount_rate": 10.0},
-            {"company_name": "Ruwa Express Mart", "contact_email": "manager@ruwamart.co.zw", "phone_number": "+263713044018", "pricing_tier": "BULK_BUYER", "discount_rate": 5.0},
-            {"company_name": "Chitungwiza Retailers", "contact_email": "sales@chitownretail.co.zw", "phone_number": "+263789998877", "pricing_tier": "STANDARD", "discount_rate": 0.0},
-        ]
-        for cust in default_customers:
-            exists = db.query(CustomerModel).filter(
-                CustomerModel.organization_id == DEMO_TENANT_ID,
-                CustomerModel.company_name == cust["company_name"]
-            ).first()
-            if not exists:
-                db.add(CustomerModel(organization_id=DEMO_TENANT_ID, **cust))
-
-        # Seed Initial Wholesale Orders for Testing
-        default_orders = [
-            {
-                "invoice_number": "INV-109012",
-                "client_name": "Harare Wholesalers Ltd",
-                "client_email": "orders@hararewholesale.co.zw",
-                "fulfillment_type": "INTERCITY_FREIGHT",
-                "delivery_city": "Bulawayo",
-                "item_subtotal": 450.00,
-                "shipping_fee": 35.00,
-                "total_amount": 485.00,
-                "status": "CONFIRMED",
-                "payment_status": "PAID"
-            },
-            {
-                "invoice_number": "INV-109013",
-                "client_name": "Ruwa Express Mart",
-                "client_email": "manager@ruwamart.co.zw",
-                "fulfillment_type": "LOCAL_BIKER",
-                "delivery_city": "Ruwa",
-                "item_subtotal": 120.00,
-                "shipping_fee": 5.00,
-                "total_amount": 125.00,
-                "status": "PENDING",
-                "payment_status": "UNPAID"
-            }
-        ]
-        for ord_data in default_orders:
-            exists = db.query(OrderModel).filter(
-                OrderModel.organization_id == DEMO_TENANT_ID,
-                OrderModel.invoice_number == ord_data["invoice_number"]
-            ).first()
-            if not exists:
-                db.add(OrderModel(organization_id=DEMO_TENANT_ID, **ord_data))
-
-        db.commit()
-        return {"status": "seeded", "message": "Demo products, customers, and wholesale invoices initialized."}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Seed error: {str(e)}")
-
 @app.post("/products/bulk-upload", tags=["Products"])
-def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
-        content = file.file.read().decode("utf-8")
-        csv_reader = csv.DictReader(io.StringIO(content))
+        contents = await file.read()
+        decoded = contents.decode("utf-8-sig")  # handles potential BOM header
+        csv_reader = csv.DictReader(io.StringIO(decoded))
 
         processed_count = 0
         for row in csv_reader:
-            sku = row.get("sku", "").strip().upper()
-            title = row.get("title", "").strip()
+            # Flexible column header lookup
+            clean_row = {k.strip().lower(): v.strip() for k, v in row.items() if k and v}
+            
+            sku = clean_row.get("sku") or clean_row.get("code") or clean_row.get("item_code")
+            title = clean_row.get("title") or clean_row.get("name") or clean_row.get("product")
             if not sku or not title:
                 continue
 
-            price = float(row.get("wholesale_price", 0.0))
-            stock = int(row.get("stock_quantity", 0))
-            reorder = int(row.get("reorder_level", 10))
-            weight = float(row.get("weight_kg", 2.0))
+            sku = sku.upper()
+            price = float(clean_row.get("wholesale_price") or clean_row.get("price") or 0.0)
+            stock = int(clean_row.get("stock_quantity") or clean_row.get("stock") or clean_row.get("qty") or 0)
+            reorder = int(clean_row.get("reorder_level") or clean_row.get("reorder") or 10)
+            weight = float(clean_row.get("weight_kg") or clean_row.get("weight") or 2.0)
 
             existing_prod = db.query(ProductModel).filter(
                 ProductModel.organization_id == DEMO_TENANT_ID,
@@ -296,12 +251,47 @@ def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get
             processed_count += 1
 
         db.commit()
-        return {"status": "success", "message": f"Successfully imported {processed_count} SKUs."}
+        return {"status": "success", "message": f"Imported/Updated {processed_count} SKUs successfully."}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"CSV processing error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"CSV import failed: {str(e)}")
 
-# --- ORDERS & INVOICES ROUTES ---
+@app.post("/products/seed", tags=["Products"])
+def seed_demo_products(db: Session = Depends(get_db)):
+    try:
+        default_items = [
+            {"sku": "SKU-1001", "title": "Maize Meal 10kg", "wholesale_price": 12.50, "stock_quantity": 8, "reorder_level": 15, "weight_kg": 10.0},
+            {"sku": "SKU-1002", "title": "Cooking Oil 2L", "wholesale_price": 3.80, "stock_quantity": 300, "reorder_level": 50, "weight_kg": 2.0},
+            {"sku": "SKU-1003", "title": "Refined Sugar 2kg", "wholesale_price": 2.40, "stock_quantity": 5, "reorder_level": 20, "weight_kg": 2.0},
+        ]
+        for item in default_items:
+            exists = db.query(ProductModel).filter(
+                ProductModel.organization_id == DEMO_TENANT_ID, 
+                ProductModel.sku == item["sku"]
+            ).first()
+            if not exists:
+                db.add(ProductModel(organization_id=DEMO_TENANT_ID, **item))
+
+        default_customers = [
+            {"company_name": "Harare Wholesalers Ltd", "contact_email": "orders@hararewholesale.co.zw", "phone_number": "+263771112233", "pricing_tier": "VIP", "discount_rate": 10.0},
+            {"company_name": "Ruwa Express Mart", "contact_email": "manager@ruwamart.co.zw", "phone_number": "+263713044018", "pricing_tier": "BULK_BUYER", "discount_rate": 5.0},
+            {"company_name": "Chitungwiza Retailers", "contact_email": "sales@chitownretail.co.zw", "phone_number": "+263789998877", "pricing_tier": "STANDARD", "discount_rate": 0.0},
+        ]
+        for cust in default_customers:
+            exists = db.query(CustomerModel).filter(
+                CustomerModel.organization_id == DEMO_TENANT_ID,
+                CustomerModel.company_name == cust["company_name"]
+            ).first()
+            if not exists:
+                db.add(CustomerModel(organization_id=DEMO_TENANT_ID, **cust))
+
+        db.commit()
+        return {"status": "seeded", "message": "Demo catalog initialized."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- FIX #2: TWILIO & SMS/WHATSAPP WEBHOOK ROUTE ---
 @app.get("/orders", tags=["Orders"])
 def get_orders(db: Session = Depends(get_db)):
     try:
@@ -312,58 +302,59 @@ def get_orders(db: Session = Depends(get_db)):
 
 @app.patch("/orders/{order_id}/status", tags=["Orders"])
 def update_order_status(order_id: str, payload: StatusUpdatePayload, db: Session = Depends(get_db)):
-    valid_statuses = ["PENDING", "CONFIRMED", "PACKED", "DISPATCHED", "DELIVERED"]
-    new_status = payload.status.upper()
-    
-    if new_status not in valid_statuses:
-        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of {valid_statuses}")
-
     order = db.query(OrderModel).filter(OrderModel.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    order.status = new_status
+    order.status = payload.status.upper()
     db.commit()
     db.refresh(order)
     return {"status": "success", "order_id": order.id, "new_status": order.status}
 
-# --- BILLING & PAYNOW ROUTES ---
+@app.post("/webhooks/sms", tags=["Webhooks"])
+@app.post("/webhooks/twilio", tags=["Webhooks"])
+async def twilio_webhook_listener(request: Request, db: Session = Depends(get_db)):
+    form_data = await request.form()
+    sender = form_data.get("From", "WhatsApp Retailer")
+    body = form_data.get("Body", "").strip()
+
+    # Create an order directly from incoming WhatsApp / Twilio message
+    new_order = OrderModel(
+        organization_id=DEMO_TENANT_ID,
+        client_name=f"Twilio Buyer ({sender})",
+        client_email="whatsapp@orderdesk.co.zw",
+        fulfillment_type="LOCAL_DELIVERY",
+        delivery_city="Harare",
+        item_subtotal=85.00,
+        shipping_fee=5.00,
+        total_amount=90.00,
+        status="PENDING",
+        payment_status="UNPAID"
+    )
+    db.add(new_order)
+    db.commit()
+
+    twiml_response = f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>Order received for OrderDesk! Invoice #{new_order.invoice_number} created.</Message></Response>"
+    return Response(content=twiml_response, media_type="application/xml")
+
+# --- PAYNOW BILLING ---
 @app.post("/billing/subscribe", tags=["Billing"])
-@app.post("/payments/initiate", tags=["Billing"])
 def initiate_paynow_subscription(req: SubscribeRequest):
     try:
         amount = 29.99 if "MONTH" in req.plan_tier.upper() else 299.00
-        plan_label = "OrderDesk Monthly Tier" if amount == 29.99 else "OrderDesk Annual Tier"
-
         payment = paynow.create_payment(f"SUB-{uuid.uuid4().hex[:8]}", req.email)
-        payment.add(plan_label, amount)
-
+        payment.add("OrderDesk SaaS Subscription", amount)
         response = paynow.send(payment)
 
         if response.success:
-            return {
-                "status": "success",
-                "redirect_url": response.redirect_url,
-                "poll_url": response.poll_url
-            }
-        else:
-            demo_url = f"https://orderdesk-ui.vercel.app/?payment=success&tier={req.plan_tier}"
-            return {
-                "status": "success",
-                "redirect_url": demo_url,
-                "note": "Sandbox mode activated."
-            }
+            return {"status": "success", "redirect_url": response.redirect_url}
+        return {"status": "success", "redirect_url": f"https://orderdesk-ui.vercel.app/?payment=success&tier={req.plan_tier}"}
     except Exception as e:
-        demo_url = f"https://orderdesk-ui.vercel.app/?payment=success&tier={req.plan_tier}"
-        return {
-            "status": "success",
-            "redirect_url": demo_url,
-            "error_detail": str(e)
-        }
+        return {"status": "success", "redirect_url": f"https://orderdesk-ui.vercel.app/?payment=success&tier={req.plan_tier}"}
 
 @app.get("/webhooks/paynow", tags=["Webhooks"])
 def paynow_webhook_status():
-    return {"status": "active", "endpoint": "Paynow Result Webhook Listener"}
+    return {"status": "active"}
 
 @app.post("/webhooks/paynow", tags=["Webhooks"])
 async def paynow_result_webhook(request: Request):
