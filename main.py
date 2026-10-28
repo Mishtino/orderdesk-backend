@@ -14,16 +14,23 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from paynow import Paynow
 
-# --- DATABASE SETUP (Production PostgreSQL / SQLite Fallback) ---
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./orderdesk.db")
+# --- DATABASE SETUP ---
+raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./orderdesk.db")
 
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Force SQLAlchemy to use psycopg2 driver explicitly
+if raw_db_url.startswith("postgres://"):
+    DATABASE_URL = raw_db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+elif raw_db_url.startswith("postgresql://") and "+psycopg2" not in raw_db_url:
+    DATABASE_URL = raw_db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+else:
+    DATABASE_URL = raw_db_url
 
-engine = create_engine(
-    DATABASE_URL, 
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
-)
+# Only include SQLite specific connect_args when actually using SQLite
+engine_args = {}
+if "sqlite" in DATABASE_URL:
+    engine_args["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **engine_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -121,7 +128,7 @@ paynow = Paynow(
 )
 
 # --- FASTAPI APP ---
-app = FastAPI(title="OrderDesk B2B Production Engine", version="4.0.0")
+app = FastAPI(title="OrderDesk B2B Production Engine", version="4.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -174,14 +181,13 @@ class CustomerUpdatePayload(BaseModel):
 class RateUpdatePayload(BaseModel):
     zig_exchange_rate: float = Field(..., gt=0.0)
 
-# --- REAL AUTHENTICATION & EMAIL VERIFICATION ---
+# --- AUTHENTICATION & EMAIL VERIFICATION ROUTES ---
 @app.post("/auth/send-code", tags=["Auth"])
 def send_verification_code(payload: SendCodePayload, db: Session = Depends(get_db)):
     clean_email = payload.email.strip().lower()
     generated_code = f"{random.randint(100000, 999999)}"
     expires_at = datetime.utcnow() + timedelta(minutes=15)
 
-    # Invalidate older codes for this email
     db.query(VerificationCodeModel).filter(VerificationCodeModel.email == clean_email).delete()
 
     record = VerificationCodeModel(
@@ -191,9 +197,6 @@ def send_verification_code(payload: SendCodePayload, db: Session = Depends(get_d
     )
     db.add(record)
     db.commit()
-
-    # TODO: In production with Resend API Key, invoke transactional mailer:
-    # resend.Emails.send({"from": "auth@orderdesk.co.zw", "to": clean_email, "subject": "OrderDesk Verification Code", "html": f"Code: {generated_code}"})
 
     return {
         "status": "success",
@@ -218,7 +221,6 @@ def verify_code(payload: VerifyCodePayload, db: Session = Depends(get_db)):
         db.commit()
         raise HTTPException(status_code=400, detail="Verification code has expired. Request a new one.")
 
-    # Mark or Create Supplier User Account
     user = db.query(SupplierUserModel).filter(SupplierUserModel.email == clean_email).first()
     if not user:
         org_id = str(uuid.uuid4())
@@ -232,7 +234,6 @@ def verify_code(payload: VerifyCodePayload, db: Session = Depends(get_db)):
     else:
         user.is_verified = True
 
-    # Delete used verification code
     db.delete(record)
     db.commit()
 
@@ -265,7 +266,7 @@ def reset_database():
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk Production B2B Engine v4.0"}
+    return {"status": "online", "system": "OrderDesk Production B2B Engine v4.2"}
 
 @app.get("/settings/rate", tags=["Settings"])
 def get_exchange_rate(org_id: str = "default", db: Session = Depends(get_db)):
