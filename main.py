@@ -10,7 +10,7 @@ from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, Response, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Boolean
+from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Boolean, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from paynow import Paynow
@@ -55,8 +55,9 @@ class SupplierUserModel(Base):
     organization_id = Column(String, nullable=False, index=True)
     organization_name = Column(String, nullable=False)
     email = Column(String, unique=True, nullable=False, index=True)
-    password = Column(String, nullable=False)
-    security_passkey = Column(String, unique=True, nullable=False, index=True)
+    password = Column(String, nullable=False, default="password")
+    security_passkey = Column(String, unique=True, nullable=False, index=True, default=lambda: generate_unique_passkey())
+    is_verified = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class ProductModel(Base):
@@ -110,7 +111,20 @@ class SettingsModel(Base):
     organization_id = Column(String, primary_key=True)
     zig_exchange_rate = Column(Float, default=26.50)
 
+# Synchronize Database Schema
 Base.metadata.create_all(bind=engine)
+
+def auto_migrate_schema():
+    """Safely adds missing columns to existing PostgreSQL tables."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE supplier_users ADD COLUMN IF NOT EXISTS password VARCHAR DEFAULT 'password';"))
+            conn.execute(text("ALTER TABLE supplier_users ADD COLUMN IF NOT EXISTS security_passkey VARCHAR;"))
+            conn.commit()
+    except Exception as e:
+        print(f"Auto-migration note: {str(e)}")
+
+auto_migrate_schema()
 
 # --- PAYNOW CONFIGURATION ---
 PAYNOW_INTEGRATION_ID = os.getenv("PAYNOW_INTEGRATION_ID", "12345")
@@ -126,7 +140,7 @@ paynow = Paynow(
 )
 
 # --- FASTAPI APP & CORS ---
-app = FastAPI(title="OrderDesk B2B Engine", version="5.1.0")
+app = FastAPI(title="OrderDesk B2B Engine", version="5.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -240,7 +254,7 @@ def login_supplier(payload: LoginPayload, db: Session = Depends(get_db)):
         "organization_id": user.organization_id,
         "organization_name": user.organization_name,
         "email": user.email,
-        "security_passkey": user.security_passkey
+        "security_passkey": user.security_passkey or generate_unique_passkey()
     }
 
 @app.post("/auth/reset-password", tags=["Auth"])
@@ -279,13 +293,14 @@ def reset_database():
     try:
         Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
+        auto_migrate_schema()
         return {"status": "success", "message": "Database reset cleanly."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk B2B Passkey Engine v5.1"}
+    return {"status": "online", "system": "OrderDesk B2B Passkey Engine v5.2"}
 
 @app.get("/settings/rate", tags=["Settings"])
 def get_exchange_rate(org_id: str = "default", db: Session = Depends(get_db)):
