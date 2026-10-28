@@ -3,6 +3,9 @@ import uuid
 import csv
 import io
 import random
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 
@@ -17,7 +20,6 @@ from paynow import Paynow
 # --- DATABASE SETUP ---
 raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./orderdesk.db")
 
-# Force SQLAlchemy to use psycopg2 driver explicitly
 if raw_db_url.startswith("postgres://"):
     DATABASE_URL = raw_db_url.replace("postgres://", "postgresql+psycopg2://", 1)
 elif raw_db_url.startswith("postgresql://") and "+psycopg2" not in raw_db_url:
@@ -25,7 +27,6 @@ elif raw_db_url.startswith("postgresql://") and "+psycopg2" not in raw_db_url:
 else:
     DATABASE_URL = raw_db_url
 
-# Only include SQLite specific connect_args when actually using SQLite
 engine_args = {}
 if "sqlite" in DATABASE_URL:
     engine_args["connect_args"] = {"check_same_thread": False}
@@ -41,7 +42,7 @@ def get_db():
     finally:
         db.close()
 
-# --- PRODUCTION MODELS ---
+# --- MODELS ---
 class SupplierUserModel(Base):
     __tablename__ = "supplier_users"
 
@@ -114,6 +115,48 @@ class SettingsModel(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# --- SMTP EMAIL HELPER ---
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", SMTP_USERNAME or "noreply@orderdesk.co.zw")
+
+def dispatch_email(target_email: str, code: str):
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        print(f"SMTP NOT CONFIGURED. VERIFICATION CODE FOR {target_email}: {code}")
+        return
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"Your OrderDesk Verification Code: {code}"
+        msg["From"] = f"OrderDesk Security <{SENDER_EMAIL}>"
+        msg["To"] = target_email
+
+        html_body = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; background-color: #f8fafc; padding: 20px;">
+                <div style="max-width: 500px; margin: 0 auto; background: #ffffff; padding: 30px; border-radius: 16px; border: 1px solid #e2e8f0;">
+                    <h2 style="color: #0f172a; margin-top: 0;">OrderDesk B2B Verification</h2>
+                    <p style="color: #475569; font-size: 14px;">Use the 6-digit verification code below to authorize your supplier sign-in session:</p>
+                    <div style="background-color: #e0e7ff; color: #4338ca; font-size: 28px; font-weight: bold; text-align: center; padding: 15px; border-radius: 12px; letter-spacing: 6px; margin: 20px 0;">
+                        {code}
+                    </div>
+                    <p style="color: #64748b; font-size: 12px;">This code will expire in 15 minutes. If you did not request this code, please ignore this email.</p>
+                </div>
+            </body>
+        </html>
+        """
+        msg.attach(MIMEText(html_body, "html"))
+
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.sendmail(SENDER_EMAIL, target_email, msg.as_string())
+        server.quit()
+    except Exception as e:
+        print(f"SMTP Email Send Failed: {str(e)}")
+
 # --- PAYNOW LIVE CONFIGURATION ---
 PAYNOW_INTEGRATION_ID = os.getenv("PAYNOW_INTEGRATION_ID", "12345")
 PAYNOW_INTEGRATION_KEY = os.getenv("PAYNOW_INTEGRATION_KEY", "sandbox-key")
@@ -128,7 +171,7 @@ paynow = Paynow(
 )
 
 # --- FASTAPI APP ---
-app = FastAPI(title="OrderDesk B2B Production Engine", version="4.2.0")
+app = FastAPI(title="OrderDesk B2B Production Engine", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -140,6 +183,8 @@ app.add_middleware(
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return Response(status_code=200)
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -197,6 +242,9 @@ def send_verification_code(payload: SendCodePayload, db: Session = Depends(get_d
     )
     db.add(record)
     db.commit()
+
+    # Dispatch email
+    dispatch_email(clean_email, generated_code)
 
     return {
         "status": "success",
@@ -266,7 +314,7 @@ def reset_database():
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk Production B2B Engine v4.2"}
+    return {"status": "online", "system": "OrderDesk Production B2B Engine v4.3"}
 
 @app.get("/settings/rate", tags=["Settings"])
 def get_exchange_rate(org_id: str = "default", db: Session = Depends(get_db)):
