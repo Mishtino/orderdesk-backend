@@ -41,6 +41,7 @@ class ProductModel(Base):
     organization_id = Column(String, nullable=False, index=True)
     sku = Column(String, nullable=False, index=True)
     title = Column(String, nullable=False)
+    category = Column(String, default="General")
     wholesale_price = Column(Float, nullable=False)
     stock_quantity = Column(Integer, default=0)
     reorder_level = Column(Integer, default=10)
@@ -72,10 +73,17 @@ class OrderModel(Base):
     item_subtotal = Column(Float, nullable=False)
     shipping_fee = Column(Float, default=0.0)
     total_amount = Column(Float, nullable=False)
+    currency = Column(String, default="USD")
     vehicle_type = Column(String, nullable=True)
     status = Column(String, default="PENDING")
     payment_status = Column(String, default="UNPAID")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class SettingsModel(Base):
+    __tablename__ = "settings"
+
+    organization_id = Column(String, primary_key=True)
+    zig_exchange_rate = Column(Float, default=26.50)  # 1 USD = 26.50 ZiG
 
 Base.metadata.create_all(bind=engine)
 
@@ -93,7 +101,7 @@ paynow = Paynow(
 )
 
 # --- FASTAPI APP ---
-app = FastAPI(title="OrderDesk B2B Engine", version="2.6.0")
+app = FastAPI(title="OrderDesk B2B Engine", version="2.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -127,18 +135,19 @@ class CustomerUpdatePayload(BaseModel):
     pricing_tier: Optional[str] = None
     discount_rate: Optional[float] = None
 
+class RateUpdatePayload(BaseModel):
+    zig_exchange_rate: float
+
 # --- HELPER: UNIVERSAL CSV COLUMN RESOLVER ---
 def extract_column_value(row: dict, candidates: List[str], default_val: str = "") -> str:
-    """Helper to match column headers flexibly regardless of casing, spaces, or aliases."""
     normalized_row = {str(k).strip().lower().replace("_", "").replace("-", "").replace(" ", ""): str(v).strip() for k, v in row.items() if k and v is not None}
-    
     for candidate in candidates:
         clean_cand = candidate.lower().replace("_", "").replace("-", "").replace(" ", "")
         if clean_cand in normalized_row:
             return normalized_row[clean_cand]
     return default_val
 
-# --- SYSTEM & HEALTH ---
+# --- SYSTEM & SETTINGS ---
 @app.post("/reset-db", tags=["System"])
 def reset_database():
     try:
@@ -150,7 +159,28 @@ def reset_database():
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk B2B Engine v2.6"}
+    return {"status": "online", "system": "OrderDesk B2B Engine v2.7"}
+
+@app.get("/settings/rate", tags=["Settings"])
+def get_exchange_rate(db: Session = Depends(get_db)):
+    setting = db.query(SettingsModel).filter(SettingsModel.organization_id == DEMO_TENANT_ID).first()
+    if not setting:
+        setting = SettingsModel(organization_id=DEMO_TENANT_ID, zig_exchange_rate=26.50)
+        db.add(setting)
+        db.commit()
+        db.refresh(setting)
+    return {"status": "success", "zig_exchange_rate": setting.zig_exchange_rate}
+
+@app.post("/settings/rate", tags=["Settings"])
+def update_exchange_rate(payload: RateUpdatePayload, db: Session = Depends(get_db)):
+    setting = db.query(SettingsModel).filter(SettingsModel.organization_id == DEMO_TENANT_ID).first()
+    if not setting:
+        setting = SettingsModel(organization_id=DEMO_TENANT_ID, zig_exchange_rate=payload.zig_exchange_rate)
+        db.add(setting)
+    else:
+        setting.zig_exchange_rate = payload.zig_exchange_rate
+    db.commit()
+    return {"status": "success", "zig_exchange_rate": setting.zig_exchange_rate}
 
 # --- RETAILER ACCOUNTS ---
 @app.get("/customers", tags=["Customers"])
@@ -224,7 +254,6 @@ async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depen
 
         processed_count = 0
         for row in csv_reader:
-            # Universal column aliases matching
             sku_raw = extract_column_value(row, ["sku", "code", "itemcode", "productcode", "id", "itemid"])
             title_raw = extract_column_value(row, ["name", "title", "product", "productname", "item", "description", "itemname"])
             
@@ -233,6 +262,7 @@ async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depen
 
             sku = sku_raw.upper()
             title = title_raw
+            category = extract_column_value(row, ["category", "cat", "group", "type"], "General")
 
             price_str = extract_column_value(row, ["unitprice", "wholesaleprice", "price", "unitcost", "cost", "rate", "amount"], "0.0")
             stock_str = extract_column_value(row, ["quantity", "stockquantity", "stock", "qty", "count", "available", "units"], "0")
@@ -251,6 +281,7 @@ async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depen
 
             if existing_prod:
                 existing_prod.title = title
+                existing_prod.category = category
                 existing_prod.wholesale_price = price
                 existing_prod.stock_quantity = stock
                 existing_prod.reorder_level = reorder
@@ -260,6 +291,7 @@ async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depen
                     organization_id=DEMO_TENANT_ID,
                     sku=sku,
                     title=title,
+                    category=category,
                     wholesale_price=price,
                     stock_quantity=stock,
                     reorder_level=reorder,
@@ -272,41 +304,6 @@ async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depen
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"CSV import failed: {str(e)}")
-
-@app.post("/products/seed", tags=["Products"])
-def seed_demo_products(db: Session = Depends(get_db)):
-    try:
-        default_items = [
-            {"sku": "SKU-1001", "title": "Maize Meal 10kg", "wholesale_price": 12.50, "stock_quantity": 8, "reorder_level": 15, "weight_kg": 10.0},
-            {"sku": "SKU-1002", "title": "Cooking Oil 2L", "wholesale_price": 3.80, "stock_quantity": 300, "reorder_level": 50, "weight_kg": 2.0},
-            {"sku": "SKU-1003", "title": "Refined Sugar 2kg", "wholesale_price": 2.40, "stock_quantity": 5, "reorder_level": 20, "weight_kg": 2.0},
-        ]
-        for item in default_items:
-            exists = db.query(ProductModel).filter(
-                ProductModel.organization_id == DEMO_TENANT_ID, 
-                ProductModel.sku == item["sku"]
-            ).first()
-            if not exists:
-                db.add(ProductModel(organization_id=DEMO_TENANT_ID, **item))
-
-        default_customers = [
-            {"company_name": "Harare Wholesalers Ltd", "contact_email": "orders@hararewholesale.co.zw", "phone_number": "+263771112233", "pricing_tier": "VIP", "discount_rate": 10.0},
-            {"company_name": "Ruwa Express Mart", "contact_email": "manager@ruwamart.co.zw", "phone_number": "+263713044018", "pricing_tier": "BULK_BUYER", "discount_rate": 5.0},
-            {"company_name": "Chitungwiza Retailers", "contact_email": "sales@chitownretail.co.zw", "phone_number": "+263789998877", "pricing_tier": "STANDARD", "discount_rate": 0.0},
-        ]
-        for cust in default_customers:
-            exists = db.query(CustomerModel).filter(
-                CustomerModel.organization_id == DEMO_TENANT_ID,
-                CustomerModel.company_name == cust["company_name"]
-            ).first()
-            if not exists:
-                db.add(CustomerModel(organization_id=DEMO_TENANT_ID, **cust))
-
-        db.commit()
-        return {"status": "seeded", "message": "Demo catalog initialized."}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
 
 # --- ORDERS & WEBHOOKS ---
 @app.get("/orders", tags=["Orders"])
