@@ -1,10 +1,7 @@
 fastapi
 uvicorn
 sqlalchemy
-psycopg[binary]
-pydantic
-python-multipart
-pyjwt
-python-dotenv
-twilio
+pydantic[email]
+email-validator
 paynow
+python-multipartemail-validator
