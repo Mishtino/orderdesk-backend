@@ -6,3 +6,7 @@ email-validator
 paynow
 python-multipart
 psycopg2-binary
+argon2-cffi
+pyjwt
+slowapi
+requests
