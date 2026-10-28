@@ -123,7 +123,6 @@ def issue_session_cookie(response: Response, user) -> None:
 def current_ctx(request: Request) -> Ctx:
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
-        # Fallback to Authorization header if cookie is omitted during API testing
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header.split(" ")[1]
