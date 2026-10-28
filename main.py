@@ -4,12 +4,13 @@ import csv
 import io
 import random
 import smtplib
+import concurrent.futures
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 
-from fastapi import FastAPI, Depends, HTTPException, Form, Response, UploadFile, File, Request
+from fastapi import FastAPI, Depends, HTTPException, Form, Response, UploadFile, File, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Boolean
@@ -115,14 +116,14 @@ class SettingsModel(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# --- SMTP EMAIL HELPER ---
+# --- NON-BLOCKING SMTP DISPATCH WITH STRICT TIMEOUT ---
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SENDER_EMAIL = os.getenv("SENDER_EMAIL", SMTP_USERNAME or "noreply@orderdesk.co.zw")
 
-def dispatch_email(target_email: str, code: str):
+def dispatch_email_sync(target_email: str, code: str):
     if not SMTP_USERNAME or not SMTP_PASSWORD:
         print(f"SMTP NOT CONFIGURED. VERIFICATION CODE FOR {target_email}: {code}")
         return
@@ -149,13 +150,15 @@ def dispatch_email(target_email: str, code: str):
         """
         msg.attach(MIMEText(html_body, "html"))
 
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        # Enforce 5 second strict socket timeout to prevent UI freezes
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=5)
         server.starttls()
         server.login(SMTP_USERNAME, SMTP_PASSWORD)
         server.sendmail(SENDER_EMAIL, target_email, msg.as_string())
         server.quit()
+        print(f"SUCCESS: Email sent to {target_email}")
     except Exception as e:
-        print(f"SMTP Email Send Failed: {str(e)}")
+        print(f"SMTP Email Send Error: {str(e)}")
 
 # --- PAYNOW LIVE CONFIGURATION ---
 PAYNOW_INTEGRATION_ID = os.getenv("PAYNOW_INTEGRATION_ID", "12345")
@@ -171,7 +174,7 @@ paynow = Paynow(
 )
 
 # --- FASTAPI APP ---
-app = FastAPI(title="OrderDesk B2B Production Engine", version="4.5.0")
+app = FastAPI(title="OrderDesk B2B Production Engine", version="4.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -231,9 +234,9 @@ class CustomerUpdatePayload(BaseModel):
 class RateUpdatePayload(BaseModel):
     zig_exchange_rate: float = Field(..., gt=0.0)
 
-# --- AUTHENTICATION & EMAIL VERIFICATION ROUTES ---
+# --- AUTHENTICATION & NON-BLOCKING VERIFICATION ROUTES ---
 @app.post("/auth/send-code", tags=["Auth"])
-def send_verification_code(payload: SendCodePayload, db: Session = Depends(get_db)):
+def send_verification_code(payload: SendCodePayload, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     clean_email = payload.email.strip().lower()
     generated_code = f"{random.randint(100000, 999999)}"
     expires_at = datetime.utcnow() + timedelta(minutes=15)
@@ -248,7 +251,8 @@ def send_verification_code(payload: SendCodePayload, db: Session = Depends(get_d
     db.add(record)
     db.commit()
 
-    dispatch_email(clean_email, generated_code)
+    # Offload email dispatch to background thread so response is INSTANT
+    background_tasks.add_task(dispatch_email_sync, clean_email, generated_code)
 
     return {
         "status": "success",
@@ -318,7 +322,7 @@ def reset_database():
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk Production B2B Engine v4.5"}
+    return {"status": "online", "system": "OrderDesk Production B2B Engine v4.6"}
 
 @app.get("/settings/rate", tags=["Settings"])
 def get_exchange_rate(org_id: str = "default", db: Session = Depends(get_db)):
