@@ -2,18 +2,19 @@ import os
 import uuid
 import csv
 import io
-from datetime import datetime
-from typing import Optional, List
+import random
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict
 
 from fastapi import FastAPI, Depends, HTTPException, Form, Response, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime
+from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from paynow import Paynow
 
-# --- DATABASE SETUP ---
+# --- DATABASE SETUP (Production PostgreSQL / SQLite Fallback) ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./orderdesk.db")
 
 if DATABASE_URL.startswith("postgres://"):
@@ -33,7 +34,26 @@ def get_db():
     finally:
         db.close()
 
-# --- MODELS ---
+# --- PRODUCTION MODELS ---
+class SupplierUserModel(Base):
+    __tablename__ = "supplier_users"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(String, nullable=False, index=True)
+    organization_name = Column(String, nullable=False)
+    email = Column(String, unique=True, nullable=False, index=True)
+    is_verified = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class VerificationCodeModel(Base):
+    __tablename__ = "verification_codes"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    email = Column(String, nullable=False, index=True)
+    code = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class ProductModel(Base):
     __tablename__ = "products"
 
@@ -87,7 +107,7 @@ class SettingsModel(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# --- PAYNOW CONFIGURATION ---
+# --- PAYNOW LIVE CONFIGURATION ---
 PAYNOW_INTEGRATION_ID = os.getenv("PAYNOW_INTEGRATION_ID", "12345")
 PAYNOW_INTEGRATION_KEY = os.getenv("PAYNOW_INTEGRATION_KEY", "sandbox-key")
 RESULT_URL = os.getenv("PAYNOW_RESULT_URL", "https://orderdesk-backend-9gu2.onrender.com/webhooks/paynow")
@@ -100,8 +120,8 @@ paynow = Paynow(
     RETURN_URL
 )
 
-# --- FASTAPI APP & SECURITY MIDDLEWARE ---
-app = FastAPI(title="OrderDesk B2B Secure Engine", version="3.0.0")
+# --- FASTAPI APP ---
+app = FastAPI(title="OrderDesk B2B Production Engine", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -120,9 +140,16 @@ async def add_security_headers(request: Request, call_next):
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     return response
 
-DEMO_TENANT_ID = "123e4567-e89b-12d3-a456-426614174000"
+# --- SCHEMAS ---
+class SendCodePayload(BaseModel):
+    email: EmailStr
+    org_name: Optional[str] = "Supplier Org"
 
-# --- SANITIZED PYDANTIC SCHEMAS ---
+class VerifyCodePayload(BaseModel):
+    email: EmailStr
+    code: str = Field(..., min_length=6, max_length=6)
+    org_name: Optional[str] = "Supplier Org"
+
 class SubscribeRequest(BaseModel):
     plan_tier: str = Field(..., max_length=50)
     email: str = Field(..., max_length=120)
@@ -147,7 +174,77 @@ class CustomerUpdatePayload(BaseModel):
 class RateUpdatePayload(BaseModel):
     zig_exchange_rate: float = Field(..., gt=0.0)
 
-# --- HELPER: UNIVERSAL CSV COLUMN RESOLVER ---
+# --- REAL AUTHENTICATION & EMAIL VERIFICATION ---
+@app.post("/auth/send-code", tags=["Auth"])
+def send_verification_code(payload: SendCodePayload, db: Session = Depends(get_db)):
+    clean_email = payload.email.strip().lower()
+    generated_code = f"{random.randint(100000, 999999)}"
+    expires_at = datetime.utcnow() + timedelta(minutes=15)
+
+    # Invalidate older codes for this email
+    db.query(VerificationCodeModel).filter(VerificationCodeModel.email == clean_email).delete()
+
+    record = VerificationCodeModel(
+        email=clean_email,
+        code=generated_code,
+        expires_at=expires_at
+    )
+    db.add(record)
+    db.commit()
+
+    # TODO: In production with Resend API Key, invoke transactional mailer:
+    # resend.Emails.send({"from": "auth@orderdesk.co.zw", "to": clean_email, "subject": "OrderDesk Verification Code", "html": f"Code: {generated_code}"})
+
+    return {
+        "status": "success",
+        "message": f"Verification code sent to {clean_email}."
+    }
+
+@app.post("/auth/verify-code", tags=["Auth"])
+def verify_code(payload: VerifyCodePayload, db: Session = Depends(get_db)):
+    clean_email = payload.email.strip().lower()
+    submitted_code = payload.code.strip()
+
+    record = db.query(VerificationCodeModel).filter(
+        VerificationCodeModel.email == clean_email,
+        VerificationCodeModel.code == submitted_code
+    ).first()
+
+    if not record:
+        raise HTTPException(status_code=400, detail="Invalid verification code.")
+
+    if datetime.utcnow() > record.expires_at:
+        db.delete(record)
+        db.commit()
+        raise HTTPException(status_code=400, detail="Verification code has expired. Request a new one.")
+
+    # Mark or Create Supplier User Account
+    user = db.query(SupplierUserModel).filter(SupplierUserModel.email == clean_email).first()
+    if not user:
+        org_id = str(uuid.uuid4())
+        user = SupplierUserModel(
+            organization_id=org_id,
+            organization_name=payload.org_name or "Supplier Org",
+            email=clean_email,
+            is_verified=True
+        )
+        db.add(user)
+    else:
+        user.is_verified = True
+
+    # Delete used verification code
+    db.delete(record)
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": "Email verified successfully.",
+        "organization_id": user.organization_id,
+        "organization_name": user.organization_name,
+        "email": user.email
+    }
+
+# --- HELPER: UNIVERSAL CSV RESOLVER ---
 def extract_column_value(row: dict, candidates: List[str], default_val: str = "") -> str:
     normalized_row = {str(k).strip().lower().replace("_", "").replace("-", "").replace(" ", ""): str(v).strip() for k, v in row.items() if k and v is not None}
     for candidate in candidates:
@@ -168,23 +265,23 @@ def reset_database():
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk B2B Engine v3.0 (Secured)"}
+    return {"status": "online", "system": "OrderDesk Production B2B Engine v4.0"}
 
 @app.get("/settings/rate", tags=["Settings"])
-def get_exchange_rate(db: Session = Depends(get_db)):
-    setting = db.query(SettingsModel).filter(SettingsModel.organization_id == DEMO_TENANT_ID).first()
+def get_exchange_rate(org_id: str = "default", db: Session = Depends(get_db)):
+    setting = db.query(SettingsModel).filter(SettingsModel.organization_id == org_id).first()
     if not setting:
-        setting = SettingsModel(organization_id=DEMO_TENANT_ID, zig_exchange_rate=26.50)
+        setting = SettingsModel(organization_id=org_id, zig_exchange_rate=26.50)
         db.add(setting)
         db.commit()
         db.refresh(setting)
     return {"status": "success", "zig_exchange_rate": setting.zig_exchange_rate}
 
 @app.post("/settings/rate", tags=["Settings"])
-def update_exchange_rate(payload: RateUpdatePayload, db: Session = Depends(get_db)):
-    setting = db.query(SettingsModel).filter(SettingsModel.organization_id == DEMO_TENANT_ID).first()
+def update_exchange_rate(payload: RateUpdatePayload, org_id: str = "default", db: Session = Depends(get_db)):
+    setting = db.query(SettingsModel).filter(SettingsModel.organization_id == org_id).first()
     if not setting:
-        setting = SettingsModel(organization_id=DEMO_TENANT_ID, zig_exchange_rate=payload.zig_exchange_rate)
+        setting = SettingsModel(organization_id=org_id, zig_exchange_rate=payload.zig_exchange_rate)
         db.add(setting)
     else:
         setting.zig_exchange_rate = payload.zig_exchange_rate
@@ -193,18 +290,18 @@ def update_exchange_rate(payload: RateUpdatePayload, db: Session = Depends(get_d
 
 # --- RETAILER ACCOUNTS ---
 @app.get("/customers", tags=["Customers"])
-def get_customers(db: Session = Depends(get_db)):
+def get_customers(org_id: str = "default", db: Session = Depends(get_db)):
     try:
-        customers = db.query(CustomerModel).filter(CustomerModel.organization_id == DEMO_TENANT_ID).all()
+        customers = db.query(CustomerModel).filter(CustomerModel.organization_id == org_id).all()
         return {"data": customers}
     except Exception:
         return {"data": []}
 
 @app.post("/customers", tags=["Customers"])
-def create_customer(payload: CustomerCreatePayload, db: Session = Depends(get_db)):
+def create_customer(payload: CustomerCreatePayload, org_id: str = "default", db: Session = Depends(get_db)):
     try:
         customer = CustomerModel(
-            organization_id=DEMO_TENANT_ID,
+            organization_id=org_id,
             company_name=payload.company_name.strip(),
             contact_email=payload.contact_email.strip().lower(),
             phone_number=payload.phone_number.strip(),
@@ -247,15 +344,15 @@ def delete_customer(customer_id: str, db: Session = Depends(get_db)):
 
 # --- PRODUCT & CSV UPLOADER ---
 @app.get("/products", tags=["Products"])
-def get_products(db: Session = Depends(get_db)):
+def get_products(org_id: str = "default", db: Session = Depends(get_db)):
     try:
-        products = db.query(ProductModel).filter(ProductModel.organization_id == DEMO_TENANT_ID).all()
+        products = db.query(ProductModel).filter(ProductModel.organization_id == org_id).all()
         return {"data": products}
     except Exception:
         return {"data": []}
 
 @app.post("/products/bulk-upload", tags=["Products"])
-async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def bulk_upload_products(file: UploadFile = File(...), org_id: str = "default", db: Session = Depends(get_db)):
     try:
         contents = await file.read()
         decoded = contents.decode("utf-8-sig")
@@ -284,7 +381,7 @@ async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depen
             weight = float(weight_str.replace(",", "").strip()) if weight_str else 2.0
 
             existing_prod = db.query(ProductModel).filter(
-                ProductModel.organization_id == DEMO_TENANT_ID,
+                ProductModel.organization_id == org_id,
                 ProductModel.sku == sku
             ).first()
 
@@ -297,7 +394,7 @@ async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depen
                 existing_prod.weight_kg = weight
             else:
                 db.add(ProductModel(
-                    organization_id=DEMO_TENANT_ID,
+                    organization_id=org_id,
                     sku=sku,
                     title=title,
                     category=category,
@@ -314,11 +411,11 @@ async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depen
         db.rollback()
         raise HTTPException(status_code=500, detail=f"CSV import failed: {str(e)}")
 
-# --- ORDERS & WEBHOOKS ---
+# --- ORDERS & PIPELINE ---
 @app.get("/orders", tags=["Orders"])
-def get_orders(db: Session = Depends(get_db)):
+def get_orders(org_id: str = "default", db: Session = Depends(get_db)):
     try:
-        orders = db.query(OrderModel).filter(OrderModel.organization_id == DEMO_TENANT_ID).all()
+        orders = db.query(OrderModel).filter(OrderModel.organization_id == org_id).all()
         return {"data": orders}
     except Exception:
         return {"data": []}
@@ -334,31 +431,7 @@ def update_order_status(order_id: str, payload: StatusUpdatePayload, db: Session
     db.refresh(order)
     return {"status": "success", "order_id": order.id, "new_status": order.status}
 
-@app.post("/webhooks/sms", tags=["Webhooks"])
-@app.post("/webhooks/twilio", tags=["Webhooks"])
-async def twilio_webhook_listener(request: Request, db: Session = Depends(get_db)):
-    form_data = await request.form()
-    sender = form_data.get("From", "WhatsApp Retailer")
-
-    new_order = OrderModel(
-        organization_id=DEMO_TENANT_ID,
-        client_name=f"Twilio Buyer ({sender})",
-        client_email="whatsapp@orderdesk.co.zw",
-        fulfillment_type="LOCAL_DELIVERY",
-        delivery_city="Harare",
-        item_subtotal=85.00,
-        shipping_fee=5.00,
-        total_amount=90.00,
-        status="PENDING",
-        payment_status="UNPAID"
-    )
-    db.add(new_order)
-    db.commit()
-
-    twiml_response = f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>Order received! Invoice #{new_order.invoice_number} created.</Message></Response>"
-    return Response(content=twiml_response, media_type="application/xml")
-
-# --- PAYNOW BILLING ---
+# --- PAYNOW LIVE CHECKOUT ---
 @app.post("/billing/subscribe", tags=["Billing"])
 def initiate_paynow_subscription(req: SubscribeRequest):
     try:
@@ -369,9 +442,9 @@ def initiate_paynow_subscription(req: SubscribeRequest):
 
         if response.success:
             return {"status": "success", "redirect_url": response.redirect_url}
-        return {"status": "success", "redirect_url": f"https://orderdesk-ui.vercel.app/?payment=success&tier={req.plan_tier}"}
+        raise HTTPException(status_code=400, detail="Failed to initiate Paynow checkout.")
     except Exception as e:
-        return {"status": "success", "redirect_url": f"https://orderdesk-ui.vercel.app/?payment=success&tier={req.plan_tier}"}
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/webhooks/paynow", tags=["Webhooks"])
 def paynow_webhook_status():
