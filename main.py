@@ -93,7 +93,7 @@ paynow = Paynow(
 )
 
 # --- FASTAPI APP ---
-app = FastAPI(title="OrderDesk B2B Engine", version="2.4.0")
+app = FastAPI(title="OrderDesk B2B Engine", version="2.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -127,6 +127,17 @@ class CustomerUpdatePayload(BaseModel):
     pricing_tier: Optional[str] = None
     discount_rate: Optional[float] = None
 
+# --- HELPER: UNIVERSAL CSV COLUMN RESOLVER ---
+def extract_column_value(row: dict, candidates: List[str], default_val: str = "") -> str:
+    """Helper to match column headers flexibly regardless of casing, spaces, or aliases."""
+    normalized_row = {str(k).strip().lower().replace("_", "").replace("-", "").replace(" ", ""): str(v).strip() for k, v in row.items() if k and v is not None}
+    
+    for candidate in candidates:
+        clean_cand = candidate.lower().replace("_", "").replace("-", "").replace(" ", "")
+        if clean_cand in normalized_row:
+            return normalized_row[clean_cand]
+    return default_val
+
 # --- SYSTEM & HEALTH ---
 @app.post("/reset-db", tags=["System"])
 def reset_database():
@@ -139,9 +150,9 @@ def reset_database():
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk B2B Engine v2.4"}
+    return {"status": "online", "system": "OrderDesk B2B Engine v2.6"}
 
-# --- FIX #3: EDITABLE / REMOVABLE RETAILER ACCOUNTS ---
+# --- RETAILER ACCOUNTS ---
 @app.get("/customers", tags=["Customers"])
 def get_customers(db: Session = Depends(get_db)):
     try:
@@ -195,7 +206,7 @@ def delete_customer(customer_id: str, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "success", "message": "Customer deleted successfully"}
 
-# --- FIX #1: ROBUST CSV UPLOADER ---
+# --- PRODUCT & UNIVERSAL CSV UPLOADER ---
 @app.get("/products", tags=["Products"])
 def get_products(db: Session = Depends(get_db)):
     try:
@@ -208,24 +219,30 @@ def get_products(db: Session = Depends(get_db)):
 async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
         contents = await file.read()
-        decoded = contents.decode("utf-8-sig")  # handles potential BOM header
+        decoded = contents.decode("utf-8-sig")
         csv_reader = csv.DictReader(io.StringIO(decoded))
 
         processed_count = 0
         for row in csv_reader:
-            # Flexible column header lookup
-            clean_row = {k.strip().lower(): v.strip() for k, v in row.items() if k and v}
+            # Universal column aliases matching
+            sku_raw = extract_column_value(row, ["sku", "code", "itemcode", "productcode", "id", "itemid"])
+            title_raw = extract_column_value(row, ["name", "title", "product", "productname", "item", "description", "itemname"])
             
-            sku = clean_row.get("sku") or clean_row.get("code") or clean_row.get("item_code")
-            title = clean_row.get("title") or clean_row.get("name") or clean_row.get("product")
-            if not sku or not title:
+            if not sku_raw or not title_raw:
                 continue
 
-            sku = sku.upper()
-            price = float(clean_row.get("wholesale_price") or clean_row.get("price") or 0.0)
-            stock = int(clean_row.get("stock_quantity") or clean_row.get("stock") or clean_row.get("qty") or 0)
-            reorder = int(clean_row.get("reorder_level") or clean_row.get("reorder") or 10)
-            weight = float(clean_row.get("weight_kg") or clean_row.get("weight") or 2.0)
+            sku = sku_raw.upper()
+            title = title_raw
+
+            price_str = extract_column_value(row, ["unitprice", "wholesaleprice", "price", "unitcost", "cost", "rate", "amount"], "0.0")
+            stock_str = extract_column_value(row, ["quantity", "stockquantity", "stock", "qty", "count", "available", "units"], "0")
+            reorder_str = extract_column_value(row, ["reorderlevel", "reorder", "minstock", "threshold", "minimumstock", "alertlevel"], "10")
+            weight_str = extract_column_value(row, ["weightkg", "weight", "mass", "kg"], "2.0")
+
+            price = float(price_str.replace("$", "").replace(",", "").strip()) if price_str else 0.0
+            stock = int(float(stock_str.replace(",", "").strip())) if stock_str else 0
+            reorder = int(float(reorder_str.replace(",", "").strip())) if reorder_str else 10
+            weight = float(weight_str.replace(",", "").strip()) if weight_str else 2.0
 
             existing_prod = db.query(ProductModel).filter(
                 ProductModel.organization_id == DEMO_TENANT_ID,
@@ -251,7 +268,7 @@ async def bulk_upload_products(file: UploadFile = File(...), db: Session = Depen
             processed_count += 1
 
         db.commit()
-        return {"status": "success", "message": f"Imported/Updated {processed_count} SKUs successfully."}
+        return {"status": "success", "message": f"Successfully processed {processed_count} SKUs."}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"CSV import failed: {str(e)}")
@@ -291,7 +308,7 @@ def seed_demo_products(db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- FIX #2: TWILIO & SMS/WHATSAPP WEBHOOK ROUTE ---
+# --- ORDERS & WEBHOOKS ---
 @app.get("/orders", tags=["Orders"])
 def get_orders(db: Session = Depends(get_db)):
     try:
@@ -316,9 +333,7 @@ def update_order_status(order_id: str, payload: StatusUpdatePayload, db: Session
 async def twilio_webhook_listener(request: Request, db: Session = Depends(get_db)):
     form_data = await request.form()
     sender = form_data.get("From", "WhatsApp Retailer")
-    body = form_data.get("Body", "").strip()
 
-    # Create an order directly from incoming WhatsApp / Twilio message
     new_order = OrderModel(
         organization_id=DEMO_TENANT_ID,
         client_name=f"Twilio Buyer ({sender})",
@@ -334,7 +349,7 @@ async def twilio_webhook_listener(request: Request, db: Session = Depends(get_db
     db.add(new_order)
     db.commit()
 
-    twiml_response = f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>Order received for OrderDesk! Invoice #{new_order.invoice_number} created.</Message></Response>"
+    twiml_response = f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>Order received! Invoice #{new_order.invoice_number} created.</Message></Response>"
     return Response(content=twiml_response, media_type="application/xml")
 
 # --- PAYNOW BILLING ---
