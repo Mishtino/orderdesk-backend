@@ -17,7 +17,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from paynow import Paynow
 
-# --- DATABASE SETUP ---
+# --- DATABASE SETUP (Explicit psycopg2 dialect for PostgreSQL) ---
 raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./orderdesk.db")
 
 if raw_db_url.startswith("postgres://"):
@@ -171,7 +171,7 @@ paynow = Paynow(
 )
 
 # --- FASTAPI APP ---
-app = FastAPI(title="OrderDesk B2B Production Engine", version="4.3.0")
+app = FastAPI(title="OrderDesk B2B Production Engine", version="4.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -184,7 +184,12 @@ app.add_middleware(
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     if request.method == "OPTIONS":
-        return Response(status_code=200)
+        response = Response(status_code=200)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -243,7 +248,6 @@ def send_verification_code(payload: SendCodePayload, db: Session = Depends(get_d
     db.add(record)
     db.commit()
 
-    # Dispatch email
     dispatch_email(clean_email, generated_code)
 
     return {
@@ -314,7 +318,7 @@ def reset_database():
 
 @app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "online", "system": "OrderDesk Production B2B Engine v4.3"}
+    return {"status": "online", "system": "OrderDesk Production B2B Engine v4.5"}
 
 @app.get("/settings/rate", tags=["Settings"])
 def get_exchange_rate(org_id: str = "default", db: Session = Depends(get_db)):
