@@ -642,6 +642,15 @@ def update_order_status(order_id: str, payload: StatusUpdatePayload, ctx: Ctx = 
     db.commit()
     return {"status": "success", "order_id": order.id, "new_status": order.status}
 
+@app.post("/orders/{order_id}/send-confirmation", tags=["Orders"])
+def send_order_confirmation(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    order = db.query(OrderModel).filter(OrderModel.id == order_id, OrderModel.organization_id == ctx.org_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).first()
+    sent = _send_order_confirmation_email(order, org.organization_name if org else "OrderDesk")
+    return {"status": "sent" if sent else "skipped", "sent": sent}
+
 @app.post("/orders/{order_id}/ship", tags=["Orders"])
 def ship_order(order_id: str, payload: ShipmentPayload, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
     order = db.query(OrderModel).filter(OrderModel.id == order_id, OrderModel.organization_id == ctx.org_id).first()
@@ -653,6 +662,8 @@ def ship_order(order_id: str, payload: ShipmentPayload, ctx: Ctx = Depends(curre
     order.shipped_at = datetime.utcnow()
     db.commit()
     db.refresh(order)
+    org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).first()
+    _send_order_confirmation_email(order, org.organization_name if org else "OrderDesk")
     return {"status": "success", "data": order}
 
 @app.post("/orders/{order_id}/deliver", tags=["Orders"])
@@ -665,6 +676,44 @@ def deliver_order(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = 
     db.commit()
     db.refresh(order)
     return {"status": "success", "data": order}
+
+def _send_order_confirmation_email(order, org_name: str):
+    if not SMTP_HOST:
+        return False
+    recipient = order.client_email
+    if not recipient:
+        return False
+    import smtplib
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["Subject"] = f"Order Confirmation {order.invoice_number} - {org_name}"
+    msg["From"] = SMTP_FROM
+    msg["To"] = recipient
+    body = [
+        f"Dear {order.client_name},",
+        "",
+        f"Thank you for your order with {org_name}.",
+        "",
+        f"Invoice: {order.invoice_number}",
+        f"Status: {order.status}",
+        f"Fulfillment: {order.fulfillment_type}",
+        f"Total: {float(order.total_amount):.2f} {order.currency}",
+        "",
+        "You can log in to the portal to view and download your invoice.",
+        "",
+        "Regards,",
+        org_name,
+    ]
+    msg.set_content("\n".join(body))
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            if SMTP_USER and SMTP_PASS:
+                server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        return True
+    except Exception:
+        return False
 
 @app.post("/orders", tags=["Orders"])
 def create_order(payload: OrderCreatePayload, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
