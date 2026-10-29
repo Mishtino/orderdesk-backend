@@ -1,7 +1,12 @@
 fastapi
-uvicorn[standard]
-psycopg2-binary
+uvicorn
 sqlalchemy
-passlib[argon2]
+pydantic
+email-validator
+paynow
+python-multipart
+psycopg2-binary
+argon2-cffi
+pyjwt
 slowapi
-pydantic[email]
+requests
