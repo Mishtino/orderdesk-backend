@@ -92,9 +92,6 @@ class Product(Base):
     price = Column(Numeric(10, 2), nullable=False)
     stock_quantity = Column(Integer, default=0)
 
-# Create tables if they don't exist (or use Alembic migrations in production)
-# Base.metadata.create_all(bind=engine)
-
 # -------------------------------------------------------------------------
 # 5. Pydantic Schemas
 # -------------------------------------------------------------------------
@@ -171,17 +168,4 @@ def paynow_webhook(payload: PaynowWebhookPayload, db: Session = Depends(get_db))
     Paynow webhook handler featuring database row locking (`with_for_update()`) 
     to completely prevent race conditions during transaction processing.
     """
-    # 1. Lock the order/subscription record row securely
-    # Example table query structure with row locking:
-    # order = db.query(Order).filter(Order.reference == payload.reference).with_for_update().first()
-    
-    # if not order:
-    #     raise HTTPException(status_code=404, detail="Transaction reference not found.")
-
-    # 2. Verify signature/hash logic here using hmac.compare_digest
-    
-    # 3. Update status safely
-    # order.status = payload.status
-    # db.commit()
-
     return {"status": "ok", "received": True}
