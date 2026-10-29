@@ -22,16 +22,22 @@ from pydantic import BaseModel, EmailStr, Field
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Boolean, Numeric, UniqueConstraint, text
+from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Boolean, Numeric, UniqueConstraint, text, inspect
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from paynow import Paynow
 
 # --- 0. CONFIGURATION & FAIL-SAFE ENVS ---
-JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(64))
+JWT_SECRET = os.getenv("JWT_SECRET", "orderdesk-dev-secret-change-in-production-please")
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://orderdesk-ui.vercel.app")
 SESSION_COOKIE = "od_session"
 SESSION_HOURS = 12
+
+_raw_secure = os.getenv("SESSION_COOKIE_SECURE", "auto").lower()
+if _raw_secure == "auto":
+    SESSION_COOKIE_SECURE = ("localhost" not in FRONTEND_ORIGIN) and FRONTEND_ORIGIN.startswith("https")
+else:
+    SESSION_COOKIE_SECURE = _raw_secure == "true"
 
 PAYNOW_INTEGRATION_ID = os.getenv("PAYNOW_INTEGRATION_ID", "12345")
 PAYNOW_INTEGRATION_KEY = os.getenv("PAYNOW_INTEGRATION_KEY", "sandbox-key")
@@ -114,8 +120,8 @@ def issue_session_cookie(response: Response, user) -> None:
         SESSION_COOKIE,
         token,
         httponly=True,
-        secure=True,
-        samesite="none",  # Required for cross-domain requests between Vercel and Render
+        secure=SESSION_COOKIE_SECURE,
+        samesite="none" if SESSION_COOKIE_SECURE else "lax",
         max_age=SESSION_HOURS * 3600,
         path="/",
     )
@@ -191,9 +197,9 @@ class OrderModel(Base):
     client_email = Column(String, default="client@orderdesk.co.zw")
     fulfillment_type = Column(String, default="PICKUP")
     delivery_city = Column(String, nullable=True)
-    item_subtotal = Column(Numeric(12, 2), nullable=False)
+    item_subtotal = Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
     shipping_fee = Column(Numeric(12, 2), default=Decimal("0.00"))
-    total_amount = Column(Numeric(12, 2), nullable=False)
+    total_amount = Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
     currency = Column(String, default="USD")
     vehicle_type = Column(String, nullable=True)
     status = Column(String, default="PENDING")
@@ -223,12 +229,42 @@ Base.metadata.create_all(bind=engine)
 
 def auto_migrate_schema():
     try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE supplier_users ADD COLUMN IF NOT EXISTS password VARCHAR;"))
-            conn.execute(text("ALTER TABLE supplier_users ADD COLUMN IF NOT EXISTS security_passkey VARCHAR;"))
-            conn.commit()
+        inspector = inspect(engine)
+        for table in Base.metadata.sorted_tables:
+            if not inspector.has_table(table.name):
+                continue
+            existing = {c["name"] for c in inspector.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in existing:
+                    continue
+                col_type = col.type.compile(dialect=engine.dialect)
+                default_clause = ""
+                if col.server_default is not None:
+                    default_clause = " DEFAULT " + str(col.server_default.arg)
+                elif col.default is not None and getattr(col.default, "is_scalar", False):
+                    val = col.default.arg
+                    if isinstance(val, str):
+                        default_clause = " DEFAULT '" + val.replace("'", "''") + "'"
+                    elif isinstance(val, bool):
+                        default_clause = " DEFAULT " + ("TRUE" if val else "FALSE")
+                    elif isinstance(val, (int, float, Decimal)):
+                        default_clause = " DEFAULT " + str(val)
+                # Don't enforce NOT NULL on a newly added column unless we have a default
+                nullable_clause = ""
+                if not col.nullable and default_clause:
+                    nullable_clause = " NOT NULL"
+                stmt = f"ALTER TABLE {table.name} ADD COLUMN {col.name} {col_type}{default_clause}{nullable_clause}"
+                if engine.dialect.name == "postgresql":
+                    stmt = f"ALTER TABLE {table.name} ADD COLUMN IF NOT EXISTS {col.name} {col_type}{default_clause}{nullable_clause}"
+                try:
+                    with engine.connect() as conn:
+                        conn.execute(text(stmt))
+                        conn.commit()
+                    print(f"Auto-migration: added {table.name}.{col.name}")
+                except Exception as e:
+                    print(f"Auto-migration note ({table.name}.{col.name}): {str(e)}")
     except Exception as e:
-        print(f"Auto-migration note: {str(e)}")
+        print(f"Auto-migration error: {str(e)}")
 
 auto_migrate_schema()
 
@@ -351,9 +387,21 @@ def login_supplier(request: Request, payload: LoginPayload, response: Response, 
         "email": user.email
     }
 
+@app.get("/auth/me", tags=["Auth"])
+def auth_me(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    user = db.query(SupplierUserModel).filter(SupplierUserModel.id == ctx.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "status": "success",
+        "organization_name": user.organization_name,
+        "email": user.email,
+        "organization_id": user.organization_id,
+    }
+
 @app.post("/auth/logout", tags=["Auth"])
 def logout_supplier(response: Response):
-    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(SESSION_COOKIE, path="/", secure=SESSION_COOKIE_SECURE, samesite="none" if SESSION_COOKIE_SECURE else "lax")
     return {"status": "success", "message": "Logged out successfully."}
 
 @app.post("/auth/reset-password", tags=["Auth"])
@@ -518,7 +566,12 @@ def initiate_paynow_subscription(req: SubscribeRequest, ctx: Ctx = Depends(curre
 
     if response.success:
         return {"status": "success", "redirect_url": response.redirect_url}
-    raise HTTPException(status_code=400, detail="Failed to initiate Paynow checkout.")
+    detail = "Failed to initiate Paynow checkout."
+    try:
+        detail = f"Failed to initiate Paynow checkout: {response.data}"
+    except Exception:
+        pass
+    raise HTTPException(status_code=400, detail=detail)
 
 def _paynow_hash(items: list) -> str:
     concat = "".join(v for k, v in items if k.lower() != "hash")
