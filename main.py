@@ -39,8 +39,8 @@ if _raw_secure == "auto":
 else:
     SESSION_COOKIE_SECURE = _raw_secure == "true"
 
-PAYNOW_INTEGRATION_ID = os.getenv("PAYNOW_INTEGRATION_ID", "12345")
-PAYNOW_INTEGRATION_KEY = os.getenv("PAYNOW_INTEGRATION_KEY", "sandbox-key")
+PAYNOW_INTEGRATION_ID = os.getenv("PAYNOW_INTEGRATION_ID", "")
+PAYNOW_INTEGRATION_KEY = os.getenv("PAYNOW_INTEGRATION_KEY", "")
 RESULT_URL = os.getenv("PAYNOW_RESULT_URL", "https://orderdesk-backend-9gu2.onrender.com/webhooks/paynow")
 RETURN_URL = os.getenv("PAYNOW_RETURN_URL", f"{FRONTEND_ORIGIN}/billing?status=success")
 
@@ -547,7 +547,10 @@ def update_order_status(order_id: str, payload: StatusUpdatePayload, ctx: Ctx = 
 # --- 11. HARDENED PAYNOW BILLING & WEBHOOK ---
 @app.post("/billing/subscribe", tags=["Billing"])
 def initiate_paynow_subscription(req: SubscribeRequest, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
-    amount = Decimal("29.99") if "MONTH" in req.plan_tier.upper() else Decimal("299.00")
+    if not PAYNOW_INTEGRATION_ID or not PAYNOW_INTEGRATION_KEY:
+        raise HTTPException(status_code=503, detail="Paynow is not configured for production. Set PAYNOW_INTEGRATION_ID and PAYNOW_INTEGRATION_KEY.")
+
+    amount = Decimal("49.00") if "MONTH" in req.plan_tier.upper() else Decimal("499.00")
     internal_ref = f"SUB-{uuid.uuid4().hex[:12].upper()}"
 
     payment = PaymentModel(
