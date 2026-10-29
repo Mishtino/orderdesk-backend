@@ -115,7 +115,7 @@ def issue_session_cookie(response: Response, user) -> None:
         token,
         httponly=True,
         secure=True,
-        samesite="lax",
+        samesite="none",  # Required for cross-domain requests between Vercel and Render
         max_age=SESSION_HOURS * 3600,
         path="/",
     )
