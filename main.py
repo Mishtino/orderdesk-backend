@@ -109,6 +109,7 @@ def verify_and_upgrade_password(user, supplied: str, db: Session) -> bool:
 class Ctx:
     user_id: str
     org_id: str
+    role: str = "ADMIN"
 
 def issue_session_cookie(response: Response, user) -> None:
     now = datetime.now(timezone.utc)
@@ -132,7 +133,7 @@ def issue_session_cookie(response: Response, user) -> None:
         path="/",
     )
 
-def current_ctx(request: Request) -> Ctx:
+def current_ctx(request: Request, db: Session = Depends(get_db)) -> Ctx:
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         auth_header = request.headers.get("Authorization")
@@ -143,11 +144,19 @@ def current_ctx(request: Request) -> Ctx:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         claims = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return Ctx(user_id=claims["sub"], org_id=claims["org"])
+        user = db.query(SupplierUserModel).filter(SupplierUserModel.id == claims["sub"]).first()
+        role = user.role if user else "ADMIN"
+        return Ctx(user_id=claims["sub"], org_id=claims["org"], role=role)
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Session expired or invalid")
 
+def require_role(ctx: Ctx, allowed: set):
+    if ctx.role not in allowed:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
 def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    return fwd.split(",")[0].strip() if fwd else get_remote_address(request)
     fwd = request.headers.get("x-forwarded-for")
     return fwd.split(",")[0].strip() if fwd else get_remote_address(request)
 
@@ -163,6 +172,7 @@ class SupplierUserModel(Base):
     email = Column(String, unique=True, nullable=False, index=True)
     password = Column(String, nullable=False)
     security_passkey = Column(String, unique=True, nullable=False, index=True)
+    role = Column(String, nullable=False, default="ADMIN")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class ProductModel(Base):
@@ -349,6 +359,15 @@ class ShipmentPayload(BaseModel):
     courier: Optional[str] = Field(None, max_length=80)
     tracking_number: Optional[str] = Field(None, max_length=120)
 
+class UserCreatePayload(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=8)
+    organization_name: Optional[str] = None
+    role: str = Field("SALES", max_length=20)
+
+class UserRoleUpdatePayload(BaseModel):
+    role: str = Field(..., max_length=20)
+
 class SubscribeRequest(BaseModel):
     plan_tier: str = Field(..., max_length=50)
 
@@ -438,6 +457,7 @@ def auth_me(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
         "organization_name": user.organization_name,
         "email": user.email,
         "organization_id": user.organization_id,
+        "role": user.role,
     }
 
 @app.post("/auth/logout", tags=["Auth"])
@@ -916,6 +936,63 @@ async def paynow_webhook(request: Request, db: Session = Depends(get_db)):
         db.commit()
 
     return Response(content="OK", media_type="text/plain")
+
+# --- 11B. USER MANAGEMENT & RBAC ---
+@app.get("/users", tags=["Users"])
+def list_users(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    require_role(ctx, {"ADMIN"})
+    users = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).all()
+    return {"data": [{"id": u.id, "email": u.email, "organization_name": u.organization_name, "role": u.role, "created_at": u.created_at} for u in users]}
+
+@app.post("/users", tags=["Users"])
+def create_user(payload: UserCreatePayload, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    require_role(ctx, {"ADMIN"})
+    if db.query(SupplierUserModel).filter(SupplierUserModel.email == payload.email.strip().lower()).first():
+        raise HTTPException(status_code=400, detail="An account with this email already exists.")
+    if payload.role not in {"ADMIN", "SALES", "WAREHOUSE", "ACCOUNTANT"}:
+        raise HTTPException(status_code=400, detail="Invalid role.")
+    org_name = payload.organization_name.strip() if payload.organization_name else None
+    if not org_name:
+        org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).first()
+        org_name = org.organization_name if org else "Organization"
+    user = SupplierUserModel(
+        organization_id=ctx.org_id,
+        organization_name=org_name,
+        email=payload.email.strip().lower(),
+        password=ph.hash(payload.password),
+        security_passkey=generate_unique_passkey(),
+        role=payload.role.upper(),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {"status": "success", "data": {"id": user.id, "email": user.email, "role": user.role}}
+
+@app.patch("/users/{user_id}/role", tags=["Users"])
+def update_user_role(user_id: str, payload: UserRoleUpdatePayload, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    require_role(ctx, {"ADMIN"})
+    if payload.role not in {"ADMIN", "SALES", "WAREHOUSE", "ACCOUNTANT"}:
+        raise HTTPException(status_code=400, detail="Invalid role.")
+    if user_id == ctx.user_id:
+        raise HTTPException(status_code=400, detail="Cannot change your own role.")
+    user = db.query(SupplierUserModel).filter(SupplierUserModel.id == user_id, SupplierUserModel.organization_id == ctx.org_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.role = payload.role.upper()
+    db.commit()
+    return {"status": "success", "user_id": user.id, "role": user.role}
+
+@app.delete("/users/{user_id}", tags=["Users"])
+def delete_user(user_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    require_role(ctx, {"ADMIN"})
+    if user_id == ctx.user_id:
+        raise HTTPException(status_code=400, detail="Cannot delete yourself.")
+    user = db.query(SupplierUserModel).filter(SupplierUserModel.id == user_id, SupplierUserModel.organization_id == ctx.org_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    db.delete(user)
+    db.commit()
+    return {"status": "success", "message": "User deleted."}
 
 # --- 12. SYSTEM & HEALTH ---
 @app.get("/", tags=["Health"])
