@@ -39,6 +39,12 @@ if _raw_secure == "auto":
 else:
     SESSION_COOKIE_SECURE = _raw_secure == "true"
 
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "alerts@orderdesk.co.zw")
+
 PAYNOW_INTEGRATION_ID = os.getenv("PAYNOW_INTEGRATION_ID", "")
 PAYNOW_INTEGRATION_KEY = os.getenv("PAYNOW_INTEGRATION_KEY", "")
 RESULT_URL = os.getenv("PAYNOW_RESULT_URL", "https://orderdesk-backend-9gu2.onrender.com/webhooks/paynow")
@@ -500,6 +506,63 @@ async def bulk_upload_products(file: UploadFile = File(...), ctx: Ctx = Depends(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"CSV import failed: {str(e)}")
+
+# --- 8B. INVENTORY ALERTS & REORDER SUGGESTIONS ---
+@app.get("/inventory/alerts", tags=["Inventory"])
+def inventory_alerts(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    products = db.query(ProductModel).filter(ProductModel.organization_id == ctx.org_id).all()
+    alerts = []
+    for p in products:
+        threshold = p.reorder_level or 10
+        if (p.stock_quantity or 0) <= threshold:
+            suggested = max(threshold * 2 - (p.stock_quantity or 0), threshold)
+            alerts.append({
+                "id": p.id,
+                "sku": p.sku,
+                "title": p.title,
+                "category": p.category,
+                "stock_quantity": p.stock_quantity,
+                "reorder_level": threshold,
+                "suggested_reorder_qty": suggested,
+                "severity": "critical" if (p.stock_quantity or 0) == 0 else "low",
+            })
+    return {"data": alerts, "count": len(alerts)}
+
+@app.post("/inventory/notify", tags=["Inventory"])
+def notify_low_stock(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    products = db.query(ProductModel).filter(ProductModel.organization_id == ctx.org_id).all()
+    alerts = [p for p in products if (p.stock_quantity or 0) <= (p.reorder_level or 10)]
+    if not alerts:
+        return {"status": "ok", "message": "No low-stock items.", "count": 0}
+
+    if not SMTP_HOST:
+        return {"status": "skipped", "message": "SMTP not configured; alerts returned only.", "count": len(alerts)}
+
+    user = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).first()
+    recipient = user.email if user else None
+    if not recipient:
+        return {"status": "skipped", "message": "No recipient email.", "count": len(alerts)}
+
+    import smtplib
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["Subject"] = f"OrderDesk Low-Stock Alert ({len(alerts)} items)"
+    msg["From"] = SMTP_FROM
+    msg["To"] = recipient
+    lines = ["The following SKUs are at or below their reorder level:", ""]
+    for p in alerts:
+        lines.append(f"- {p.sku} {p.title}: stock={p.stock_quantity}, reorder_level={p.reorder_level or 10}")
+    msg.set_content("\n".join(lines))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            if SMTP_USER and SMTP_PASS:
+                server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        return {"status": "sent", "count": len(alerts)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send alert email: {str(e)}")
 
 # --- 9. TENANT-SCOPED CUSTOMERS ---
 @app.get("/customers", tags=["Customers"])
