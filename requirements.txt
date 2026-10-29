@@ -10,3 +10,4 @@ argon2-cffi
 pyjwt
 slowapi
 requests
+reportlab

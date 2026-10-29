@@ -206,6 +206,18 @@ class OrderModel(Base):
     payment_status = Column(String, default="UNPAID")
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class OrderItemModel(Base):
+    __tablename__ = "order_items"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    order_id = Column(String, nullable=False, index=True)
+    organization_id = Column(String, nullable=False, index=True)
+    sku = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    quantity = Column(Integer, nullable=False, default=1)
+    unit_price = Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
+    line_total = Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
+
 class PaymentModel(Base):
     __tablename__ = "payments"
     __table_args__ = (UniqueConstraint("reference", name="uq_payment_reference"),)
@@ -328,6 +340,21 @@ class SubscribeRequest(BaseModel):
 
 class RateUpdatePayload(BaseModel):
     zig_exchange_rate: float = Field(..., gt=0.0)
+
+class OrderItemCreate(BaseModel):
+    sku: str
+    title: str
+    quantity: int = Field(..., gt=0)
+    unit_price: float = Field(..., ge=0)
+
+class OrderCreatePayload(BaseModel):
+    client_name: str = Field(..., max_length=150)
+    client_email: Optional[str] = None
+    fulfillment_type: str = Field("PICKUP", max_length=30)
+    delivery_city: Optional[str] = None
+    shipping_fee: float = Field(0.0, ge=0)
+    currency: str = Field("USD", max_length=10)
+    items: List[OrderItemCreate] = Field(..., min_length=1)
 
 # --- 7. AUTHENTICATION ENDPOINTS ---
 @app.post("/auth/register", tags=["Auth"])
@@ -543,6 +570,118 @@ def update_order_status(order_id: str, payload: StatusUpdatePayload, ctx: Ctx = 
     order.status = payload.status.upper()
     db.commit()
     return {"status": "success", "order_id": order.id, "new_status": order.status}
+
+@app.post("/orders", tags=["Orders"])
+def create_order(payload: OrderCreatePayload, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    subtotal = Decimal("0.00")
+    for it in payload.items:
+        subtotal += Decimal(str(it.unit_price)) * it.quantity
+    shipping = Decimal(str(payload.shipping_fee))
+    total = subtotal + shipping
+
+    order = OrderModel(
+        organization_id=ctx.org_id,
+        client_name=payload.client_name.strip(),
+        client_email=(payload.client_email or "client@orderdesk.co.zw").strip().lower(),
+        fulfillment_type=payload.fulfillment_type.upper(),
+        delivery_city=payload.delivery_city,
+        item_subtotal=subtotal,
+        shipping_fee=shipping,
+        total_amount=total,
+        currency=payload.currency.upper(),
+        status="PENDING",
+        payment_status="UNPAID",
+    )
+    db.add(order)
+    db.flush()
+
+    for it in payload.items:
+        line_total = Decimal(str(it.unit_price)) * it.quantity
+        db.add(OrderItemModel(
+            order_id=order.id,
+            organization_id=ctx.org_id,
+            sku=it.sku.strip().upper(),
+            title=it.title.strip(),
+            quantity=it.quantity,
+            unit_price=Decimal(str(it.unit_price)),
+            line_total=line_total,
+        ))
+    db.commit()
+    db.refresh(order)
+    return {"status": "success", "data": order}
+
+@app.get("/orders/{order_id}/invoice", tags=["Orders"])
+def get_invoice(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    order = db.query(OrderModel).filter(
+        OrderModel.id == order_id,
+        OrderModel.organization_id == ctx.org_id,
+    ).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    items = db.query(OrderItemModel).filter(OrderItemModel.order_id == order.id).all()
+    org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).first()
+
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    from io import BytesIO
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=40, bottomMargin=40)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph(f"<b>{org.organization_name if org else 'OrderDesk Supplier'}</b>", styles["Title"]))
+    story.append(Paragraph("INVOICE", styles["Heading2"]))
+    story.append(Spacer(1, 12))
+
+    meta = [
+        ["Invoice #", order.invoice_number],
+        ["Date", order.created_at.strftime("%Y-%m-%d") if order.created_at else ""],
+        ["Client", order.client_name],
+        ["Email", order.client_email],
+        ["Fulfillment", order.fulfillment_type],
+        ["Status", order.status],
+        ["Payment", order.payment_status],
+    ]
+    t = Table(meta, colWidths=[120, 360])
+    t.setStyle(TableStyle([("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 10)]))
+    story.append(t)
+    story.append(Spacer(1, 16))
+
+    rows = [["SKU", "Description", "Qty", "Unit Price", "Line Total"]]
+    for it in items:
+        rows.append([it.sku, it.title, str(it.quantity), f"{float(it.unit_price):.2f}", f"{float(it.line_total):.2f}"])
+    rows.append(["", "", "", "Subtotal", f"{float(order.item_subtotal):.2f}"])
+    rows.append(["", "", "", "Shipping", f"{float(order.shipping_fee):.2f}"])
+    rows.append(["", "", "", "TOTAL", f"{float(order.total_amount):.2f} {order.currency}"])
+
+    table = Table(rows, colWidths=[80, 200, 50, 90, 90])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4f46e5")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -2), 0.5, colors.grey),
+        ("ALIGN", (2, 1), (-1, -1), "RIGHT"),
+        ("FONTNAME", (3, -1), (-1, -1), "Helvetica-Bold"),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 24))
+    story.append(Paragraph("Thank you for your business.", styles["Italic"]))
+
+    doc.build(story)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+
+    from fastapi.responses import Response as FastAPIResponse
+    return FastAPIResponse(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="invoice-{order.invoice_number}.pdf"'},
+    )
 
 # --- 11. HARDENED PAYNOW BILLING & WEBHOOK ---
 @app.post("/billing/subscribe", tags=["Billing"])
