@@ -211,6 +211,10 @@ class OrderModel(Base):
     status = Column(String, default="PENDING")
     payment_status = Column(String, default="UNPAID")
     created_at = Column(DateTime, default=datetime.utcnow)
+    courier = Column(String, nullable=True)
+    tracking_number = Column(String, nullable=True)
+    shipped_at = Column(DateTime, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
 
 class OrderItemModel(Base):
     __tablename__ = "order_items"
@@ -340,6 +344,10 @@ class CustomerUpdatePayload(BaseModel):
 
 class StatusUpdatePayload(BaseModel):
     status: str = Field(..., max_length=30)
+
+class ShipmentPayload(BaseModel):
+    courier: Optional[str] = Field(None, max_length=80)
+    tracking_number: Optional[str] = Field(None, max_length=120)
 
 class SubscribeRequest(BaseModel):
     plan_tier: str = Field(..., max_length=50)
@@ -633,6 +641,30 @@ def update_order_status(order_id: str, payload: StatusUpdatePayload, ctx: Ctx = 
     order.status = payload.status.upper()
     db.commit()
     return {"status": "success", "order_id": order.id, "new_status": order.status}
+
+@app.post("/orders/{order_id}/ship", tags=["Orders"])
+def ship_order(order_id: str, payload: ShipmentPayload, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    order = db.query(OrderModel).filter(OrderModel.id == order_id, OrderModel.organization_id == ctx.org_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if payload.courier: order.courier = payload.courier.strip()
+    if payload.tracking_number: order.tracking_number = payload.tracking_number.strip()
+    order.status = "SHIPPED"
+    order.shipped_at = datetime.utcnow()
+    db.commit()
+    db.refresh(order)
+    return {"status": "success", "data": order}
+
+@app.post("/orders/{order_id}/deliver", tags=["Orders"])
+def deliver_order(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    order = db.query(OrderModel).filter(OrderModel.id == order_id, OrderModel.organization_id == ctx.org_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    order.status = "DELIVERED"
+    order.delivered_at = datetime.utcnow()
+    db.commit()
+    db.refresh(order)
+    return {"status": "success", "data": order}
 
 @app.post("/orders", tags=["Orders"])
 def create_order(payload: OrderCreatePayload, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
