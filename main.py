@@ -1,4 +1,5 @@
 import os
+import json
 import uuid
 import csv
 import io
@@ -337,6 +338,17 @@ class AuditLogModel(Base):
     entity = Column(String, nullable=False)
     entity_id = Column(String, nullable=True)
     detail = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class WebhookModel(Base):
+    __tablename__ = "webhooks"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(String, nullable=False, index=True)
+    url = Column(String, nullable=False)
+    secret = Column(String, nullable=True)
+    events = Column(String, nullable=False, default="*")
+    active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
@@ -861,6 +873,7 @@ def update_order_status(order_id: str, payload: StatusUpdatePayload, ctx: Ctx = 
     order.status = payload.status.upper()
     db.add(OrderStatusHistoryModel(order_id=order.id, organization_id=ctx.org_id, from_status=_old, to_status=payload.status.upper(), changed_by=ctx.user_id, note="Status updated"))
     audit(db, ctx, "status_change", "order", order.id, f"{_old}->{payload.status.upper()}")
+    dispatch_webhooks(ctx.org_id, "order.status_changed", {"order_id": order.id, "from": _old, "to": payload.status.upper()})
     db.commit()
     return {"status": "success", "order_id": order.id, "new_status": order.status}
 
@@ -1096,6 +1109,7 @@ def create_order(payload: OrderCreatePayload, ctx: Ctx = Depends(current_ctx), d
     db.commit()
     db.refresh(order)
     audit(db, ctx, "create", "order", order.id, order.invoice_number)
+    dispatch_webhooks(ctx.org_id, "order.created", {"order_id": order.id, "invoice_number": order.invoice_number, "total": float(order.total_amount), "currency": order.currency, "status": order.status})
     return {"status": "success", "data": order}
 
 @app.get("/orders/{order_id}/invoice", tags=["Orders"])
@@ -1395,6 +1409,82 @@ def audit(db, ctx, action, entity, entity_id=None, detail=None):
 @app.get("/audit-logs", tags=["Audit"])
 def list_audit_logs(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db), limit: int = 100):
     rows = db.query(AuditLogModel).filter(AuditLogModel.organization_id == ctx.org_id).order_by(AuditLogModel.created_at.desc()).limit(limit).all()
+# --- WEBHOOKS ---
+import threading as _threading
+
+class WebhookCreate(BaseModel):
+    url: str
+    events: Optional[str] = "*"
+    secret: Optional[str] = None
+
+@app.post("/webhooks", tags=["Webhooks"])
+def create_webhook(payload: WebhookCreate, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    wh = WebhookModel(organization_id=ctx.org_id, url=payload.url.strip(), events=payload.events or "*", secret=payload.secret)
+    db.add(wh)
+    db.commit()
+    db.refresh(wh)
+    audit(db, ctx, "create", "webhook", wh.id, wh.url)
+    return {"id": wh.id, "url": wh.url, "events": wh.events, "active": wh.active, "created_at": wh.created_at}
+
+@app.get("/webhooks", tags=["Webhooks"])
+def list_webhooks(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    rows = db.query(WebhookModel).filter(WebhookModel.organization_id == ctx.org_id).order_by(WebhookModel.created_at.desc()).all()
+    return {"data": [{"id": w.id, "url": w.url, "events": w.events, "active": w.active, "created_at": w.created_at} for w in rows]}
+
+@app.delete("/webhooks/{wh_id}", tags=["Webhooks"])
+def delete_webhook(wh_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    wh = db.query(WebhookModel).filter(WebhookModel.id == wh_id, WebhookModel.organization_id == ctx.org_id).first()
+    if not wh:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    db.delete(wh)
+    db.commit()
+    return {"status": "success"}
+
+@app.patch("/webhooks/{wh_id}", tags=["Webhooks"])
+def toggle_webhook(wh_id: str, payload: dict, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    wh = db.query(WebhookModel).filter(WebhookModel.id == wh_id, WebhookModel.organization_id == ctx.org_id).first()
+    if not wh:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    if "active" in payload:
+        wh.active = bool(payload["active"])
+    if "events" in payload:
+        wh.events = payload["events"]
+    if "url" in payload:
+        wh.url = payload["url"]
+    db.commit()
+    return {"status": "success", "id": wh.id, "active": wh.active}
+
+def _dispatch_one(wh_id, url, secret, event, payload):
+    try:
+        import requests as _r
+        headers = {"Content-Type": "application/json", "X-OrderDesk-Event": event}
+        if secret:
+            import hmac as _h, hashlib as _hl
+            body = json.dumps(payload)
+            sig = _h.new(secret.encode(), body.encode(), _hl.sha256).hexdigest()
+            headers["X-OrderDesk-Signature"] = sig
+            _r.post(url, data=body, headers=headers, timeout=10)
+        else:
+            _r.post(url, json=payload, headers=headers, timeout=10)
+    except Exception:
+        pass
+
+def dispatch_webhooks(org_id, event, payload, db_factory=None):
+    try:
+        from sqlalchemy.orm import Session
+        # use a fresh session via the global SessionLocal if available
+        db = SessionLocal() if "SessionLocal" in globals() else None
+        if db is None:
+            return
+        whs = db.query(WebhookModel).filter(WebhookModel.organization_id == org_id, WebhookModel.active == True).all()
+        for w in whs:
+            evs = [e.strip() for e in (w.events or "*").split(",")]
+            if "*" in evs or event in evs:
+                _threading.Thread(target=_dispatch_one, args=(w.id, w.url, w.secret, event, payload), daemon=True).start()
+        db.close()
+    except Exception:
+        pass
+
     return {"data": [{"id": r.id, "user_id": r.user_id, "action": r.action, "entity": r.entity, "entity_id": r.entity_id, "detail": r.detail, "created_at": r.created_at} for r in rows]}
 
     return s
