@@ -32,6 +32,8 @@ JWT_SECRET = os.getenv("JWT_SECRET", "orderdesk-dev-secret-change-in-production-
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://orderdesk-ui.vercel.app")
 SESSION_COOKIE = "od_session"
 SESSION_HOURS = 12
+BUYER_COOKIE = "od_buyer_session"
+BUYER_SESSION_HOURS = 24
 
 _raw_secure = os.getenv("SESSION_COOKIE_SECURE", "auto").lower()
 if _raw_secure == "auto":
@@ -173,6 +175,17 @@ class SupplierUserModel(Base):
     password = Column(String, nullable=False)
     security_passkey = Column(String, unique=True, nullable=False, index=True)
     role = Column(String, nullable=False, default="ADMIN")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class BuyerUserModel(Base):
+    __tablename__ = "buyer_users"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(String, nullable=False, index=True)
+    customer_id = Column(String, nullable=True, index=True)
+    company_name = Column(String, nullable=False)
+    email = Column(String, unique=True, nullable=False, index=True)
+    password = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class ProductModel(Base):
@@ -479,6 +492,116 @@ def reset_password(request: Request, payload: ResetPasswordPayload, db: Session 
     db.commit()
 
     return {"status": "success", "message": "Password updated successfully. You can now sign in."}
+
+# --- 7B. BUYER PORTAL AUTH & ENDPOINTS ---
+class BuyerRegisterPayload(BaseModel):
+    organization_id: str
+    company_name: str = Field(..., max_length=150)
+    email: EmailStr
+    password: str = Field(..., min_length=8)
+
+class BuyerLoginPayload(BaseModel):
+    email: EmailStr
+    password: str
+
+def _issue_buyer_cookie(response, buyer):
+    now = datetime.now(timezone.utc)
+    token = jwt.encode({"sub": buyer.id, "org": buyer.organization_id, "type": "buyer", "iat": now, "exp": now + timedelta(hours=BUYER_SESSION_HOURS)}, JWT_SECRET, algorithm="HS256")
+    response.set_cookie(BUYER_COOKIE, token, httponly=True, secure=SESSION_COOKIE_SECURE, samesite="none" if SESSION_COOKIE_SECURE else "lax", max_age=BUYER_SESSION_HOURS*3600, path="/")
+
+def current_buyer(request: Request, db: Session = Depends(get_db)):
+    token = request.cookies.get(BUYER_COOKIE)
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        claims = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        if claims.get("type") != "buyer":
+            raise HTTPException(status_code=401, detail="Not a buyer session")
+        buyer = db.query(BuyerUserModel).filter(BuyerUserModel.id == claims["sub"]).first()
+        if not buyer:
+            raise HTTPException(status_code=401, detail="Buyer not found")
+        return buyer
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+
+@app.post("/buyer/auth/register", tags=["Buyer"])
+def buyer_register(payload: BuyerRegisterPayload, db: Session = Depends(get_db)):
+    if db.query(BuyerUserModel).filter(BuyerUserModel.email == payload.email.strip().lower()).first():
+        raise HTTPException(status_code=400, detail="An account with this email already exists.")
+    buyer = BuyerUserModel(
+        organization_id=payload.organization_id,
+        company_name=payload.company_name.strip(),
+        email=payload.email.strip().lower(),
+        password=ph.hash(payload.password),
+    )
+    db.add(buyer)
+    db.commit()
+    db.refresh(buyer)
+    return {"status": "success", "buyer_id": buyer.id}
+
+@app.post("/buyer/auth/login", tags=["Buyer"])
+def buyer_login(payload: BuyerLoginPayload, response: Response, db: Session = Depends(get_db)):
+    buyer = db.query(BuyerUserModel).filter(BuyerUserModel.email == payload.email.strip().lower()).first()
+    if not buyer or not verify_and_upgrade_password(buyer, payload.password, db):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    _issue_buyer_cookie(response, buyer)
+    return {"status": "success", "company_name": buyer.company_name, "email": buyer.email, "organization_id": buyer.organization_id}
+
+@app.post("/buyer/auth/logout", tags=["Buyer"])
+def buyer_logout(response: Response):
+    response.delete_cookie(BUYER_COOKIE, path="/", secure=SESSION_COOKIE_SECURE, samesite="none" if SESSION_COOKIE_SECURE else "lax")
+    return {"status": "success"}
+
+@app.get("/buyer/auth/me", tags=["Buyer"])
+def buyer_me(buyer: BuyerUserModel = Depends(current_buyer)):
+    return {"status": "success", "company_name": buyer.company_name, "email": buyer.email, "organization_id": buyer.organization_id, "customer_id": buyer.customer_id}
+
+@app.get("/buyer/products", tags=["Buyer"])
+def buyer_products(buyer: BuyerUserModel = Depends(current_buyer), db: Session = Depends(get_db)):
+    products = db.query(ProductModel).filter(ProductModel.organization_id == buyer.organization_id).all()
+    return {"data": products}
+
+@app.get("/buyer/orders", tags=["Buyer"])
+def buyer_orders(buyer: BuyerUserModel = Depends(current_buyer), db: Session = Depends(get_db)):
+    orders = db.query(OrderModel).filter(OrderModel.organization_id == buyer.organization_id, OrderModel.client_email == buyer.email).all()
+    return {"data": orders}
+
+@app.post("/buyer/orders", tags=["Buyer"])
+def buyer_create_order(payload: OrderCreatePayload, buyer: BuyerUserModel = Depends(current_buyer), db: Session = Depends(get_db)):
+    payload.client_name = buyer.company_name
+    payload.client_email = buyer.email
+    # reuse create_order logic by calling it directly
+    from fastapi import BackgroundTasks
+    # delegate
+    ctx = None
+    # Build order manually
+    subtotal = Decimal("0.00")
+    for it in payload.items:
+        subtotal += Decimal(str(it.unit_price)) * it.quantity
+    shipping = Decimal(str(payload.shipping_fee))
+    total = subtotal + shipping
+    order = OrderModel(
+        organization_id=buyer.organization_id,
+        client_name=buyer.company_name,
+        client_email=buyer.email,
+        fulfillment_type=payload.fulfillment_type.upper(),
+        delivery_city=payload.delivery_city,
+        item_subtotal=subtotal,
+        shipping_fee=shipping,
+        total_amount=total,
+        currency=payload.currency.upper(),
+        status="PENDING",
+        payment_status="UNPAID",
+    )
+    db.add(order)
+    db.flush()
+    for it in payload.items:
+        db.add(OrderItemModel(order_id=order.id, organization_id=buyer.organization_id, sku=it.sku.strip().upper(), title=it.title.strip(), quantity=it.quantity, unit_price=Decimal(str(it.unit_price)), line_total=Decimal(str(it.unit_price))*it.quantity))
+    db.commit()
+    db.refresh(order)
+    org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == buyer.organization_id).first()
+    _send_order_confirmation_email(order, org.organization_name if org else "OrderDesk")
+    return {"status": "success", "data": order}
 
 # --- 8. TENANT-SCOPED PRODUCTS ---
 @app.get("/products", tags=["Products"])
