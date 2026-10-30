@@ -230,6 +230,8 @@ class OrderModel(Base):
     shipping_fee = Column(Numeric(12, 2), default=Decimal("0.00"))
     total_amount = Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
     currency = Column(String, default="USD")
+    tax_rate = Column(Numeric(5, 2), default=Decimal("0.00"))
+    tax_amount = Column(Numeric(12, 2), default=Decimal("0.00"))
     vehicle_type = Column(String, nullable=True)
     status = Column(String, default="PENDING")
     payment_status = Column(String, default="UNPAID")
@@ -251,6 +253,28 @@ class OrderItemModel(Base):
     unit_price = Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
     line_total = Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
 
+class OrderStatusHistoryModel(Base):
+    __tablename__ = "order_status_history"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    order_id = Column(String, nullable=False, index=True)
+    organization_id = Column(String, nullable=False, index=True)
+    from_status = Column(String, nullable=True)
+    to_status = Column(String, nullable=False)
+    changed_by = Column(String, nullable=True)
+    note = Column(String, nullable=True)
+    changed_at = Column(DateTime, default=datetime.utcnow)
+
+class OrderNoteModel(Base):
+    __tablename__ = "order_notes"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    order_id = Column(String, nullable=False, index=True)
+    organization_id = Column(String, nullable=False, index=True)
+    author = Column(String, nullable=True)
+    note = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class PaymentModel(Base):
     __tablename__ = "payments"
     __table_args__ = (UniqueConstraint("reference", name="uq_payment_reference"),)
@@ -269,6 +293,7 @@ class SettingsModel(Base):
 
     organization_id = Column(String, primary_key=True)
     zig_exchange_rate = Column(Numeric(10, 4), default=Decimal("26.5000"))
+    tax_rate = Column(Numeric(5, 2), default=Decimal("0.00"))
 
 Base.metadata.create_all(bind=engine)
 
@@ -386,6 +411,7 @@ class SubscribeRequest(BaseModel):
 
 class RateUpdatePayload(BaseModel):
     zig_exchange_rate: float = Field(..., gt=0.0)
+    tax_rate: Optional[float] = Field(None, ge=0.0, le=100.0)
 
 class OrderItemCreate(BaseModel):
     sku: str
@@ -400,6 +426,7 @@ class OrderCreatePayload(BaseModel):
     delivery_city: Optional[str] = None
     shipping_fee: float = Field(0.0, ge=0)
     currency: str = Field("USD", max_length=10)
+    tax_rate: Optional[float] = None
     items: List[OrderItemCreate] = Field(..., min_length=1)
 
 # --- 7. AUTHENTICATION ENDPOINTS ---
@@ -781,7 +808,9 @@ def update_order_status(order_id: str, payload: StatusUpdatePayload, ctx: Ctx = 
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    _old = order.status
     order.status = payload.status.upper()
+    db.add(OrderStatusHistoryModel(order_id=order.id, organization_id=ctx.org_id, from_status=_old, to_status=payload.status.upper(), changed_by=ctx.user_id, note="Status updated"))
     db.commit()
     return {"status": "success", "order_id": order.id, "new_status": order.status}
 
@@ -801,8 +830,10 @@ def ship_order(order_id: str, payload: ShipmentPayload, ctx: Ctx = Depends(curre
         raise HTTPException(status_code=404, detail="Order not found")
     if payload.courier: order.courier = payload.courier.strip()
     if payload.tracking_number: order.tracking_number = payload.tracking_number.strip()
+    _old = order.status
     order.status = "SHIPPED"
     order.shipped_at = datetime.utcnow()
+    db.add(OrderStatusHistoryModel(order_id=order.id, organization_id=ctx.org_id, from_status=_old, to_status="SHIPPED", changed_by=ctx.user_id, note="Shipped"))
     db.commit()
     db.refresh(order)
     org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).first()
@@ -814,13 +845,49 @@ def deliver_order(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = 
     order = db.query(OrderModel).filter(OrderModel.id == order_id, OrderModel.organization_id == ctx.org_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    _old = order.status
     order.status = "DELIVERED"
     order.delivered_at = datetime.utcnow()
+    db.add(OrderStatusHistoryModel(order_id=order.id, organization_id=ctx.org_id, from_status=_old, to_status="DELIVERED", changed_by=ctx.user_id, note="Delivered"))
     db.commit()
     db.refresh(order)
     org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).first()
     _send_status_email(order, org.organization_name if org else "OrderDesk", "DELIVERED")
     return {"status": "success", "data": order}
+
+@app.get("/orders/{order_id}/notes", tags=["Orders"])
+def list_order_notes(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    order = db.query(OrderModel).filter(OrderModel.id == order_id, OrderModel.organization_id == ctx.org_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    notes = db.query(OrderNoteModel).filter(OrderNoteModel.order_id == order_id).order_by(OrderNoteModel.created_at).all()
+    return {"data": [{"id": n.id, "author": n.author, "note": n.note, "created_at": n.created_at} for n in notes]}
+
+@app.post("/orders/{order_id}/notes", tags=["Orders"])
+def add_order_note(order_id: str, payload: dict, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    order = db.query(OrderModel).filter(OrderModel.id == order_id, OrderModel.organization_id == ctx.org_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    note = OrderNoteModel(order_id=order_id, organization_id=ctx.org_id, author=payload.get("author"), note=payload.get("note", ""))
+    if not note.note:
+        raise HTTPException(status_code=400, detail="Note required")
+    db.add(note)
+    db.commit()
+    db.refresh(note)
+    return {"status": "success", "data": {"id": note.id, "note": note.note, "created_at": note.created_at}}
+    order = db.query(OrderModel).filter(OrderModel.id == order_id, OrderModel.organization_id == ctx.org_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    rows = db.query(OrderStatusHistoryModel).filter(OrderStatusHistoryModel.order_id == order_id).order_by(OrderStatusHistoryModel.changed_at).all()
+    return {"data": [{"id": r.id, "from_status": r.from_status, "to_status": r.to_status, "changed_by": r.changed_by, "note": r.note, "changed_at": r.changed_at} for r in rows]}
+
+@app.get("/orders/{order_id}/history", tags=["Orders"])
+def order_history(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    order = db.query(OrderModel).filter(OrderModel.id == order_id, OrderModel.organization_id == ctx.org_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    rows = db.query(OrderStatusHistoryModel).filter(OrderStatusHistoryModel.order_id == order_id).order_by(OrderStatusHistoryModel.changed_at).all()
+    return {"data": [{"id": r.id, "from_status": r.from_status, "to_status": r.to_status, "changed_by": r.changed_by, "note": r.note, "changed_at": r.changed_at} for r in rows]}
 
 @app.post("/orders/{order_id}/payment-reminder", tags=["Orders"])
 def payment_reminder(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
@@ -941,7 +1008,13 @@ def create_order(payload: OrderCreatePayload, ctx: Ctx = Depends(current_ctx), d
     for it in payload.items:
         subtotal += Decimal(str(it.unit_price)) * it.quantity
     shipping = Decimal(str(payload.shipping_fee))
-    total = subtotal + shipping
+    if payload.tax_rate is None:
+        setting = db.query(SettingsModel).filter(SettingsModel.organization_id == ctx.org_id).first()
+        tr = setting.tax_rate if setting else Decimal("0.00")
+    else:
+        tr = Decimal(str(payload.tax_rate))
+    tax_amount = (subtotal * tr / Decimal("100")).quantize(Decimal("0.01"))
+    total = subtotal + shipping + tax_amount
 
     order = OrderModel(
         organization_id=ctx.org_id,
@@ -951,6 +1024,8 @@ def create_order(payload: OrderCreatePayload, ctx: Ctx = Depends(current_ctx), d
         delivery_city=payload.delivery_city,
         item_subtotal=subtotal,
         shipping_fee=shipping,
+        tax_rate=tr,
+        tax_amount=tax_amount,
         total_amount=total,
         currency=payload.currency.upper(),
         status="PENDING",
@@ -1020,6 +1095,8 @@ def get_invoice(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = De
         rows.append([it.sku, it.title, str(it.quantity), f"{float(it.unit_price):.2f}", f"{float(it.line_total):.2f}"])
     rows.append(["", "", "", "Subtotal", f"{float(order.item_subtotal):.2f}"])
     rows.append(["", "", "", "Shipping", f"{float(order.shipping_fee):.2f}"])
+    if float(order.tax_amount or 0) > 0:
+        rows.append(["", "", "", f"Tax ({float(order.tax_rate)}%)", f"{float(order.tax_amount):.2f}"])
     rows.append(["", "", "", "TOTAL", f"{float(order.total_amount):.2f} {order.currency}"])
 
     table = Table(rows, colWidths=[80, 200, 50, 90, 90])
@@ -1194,6 +1271,31 @@ def delete_user(user_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Dep
     db.commit()
     return {"status": "success", "message": "User deleted."}
 
+# --- 11C. CSV EXPORT ---
+@app.get("/export/orders", tags=["Export"])
+def export_orders(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    orders = db.query(OrderModel).filter(OrderModel.organization_id == ctx.org_id).all()
+    import csv as _csv, io as _io
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["invoice_number", "client_name", "client_email", "status", "payment_status", "fulfillment_type", "item_subtotal", "shipping_fee", "tax_rate", "tax_amount", "total_amount", "currency", "courier", "tracking_number", "created_at"])
+    for o in orders:
+        w.writerow([o.invoice_number, o.client_name, o.client_email, o.status, o.payment_status, o.fulfillment_type, float(o.item_subtotal), float(o.shipping_fee), float(o.tax_rate), float(o.tax_amount), float(o.total_amount), o.currency, o.courier, o.tracking_number, o.created_at])
+    from fastapi.responses import Response as R
+    return R(content=buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="orders.csv"'})
+
+@app.get("/export/products", tags=["Export"])
+def export_products(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    products = db.query(ProductModel).filter(ProductModel.organization_id == ctx.org_id).all()
+    import csv as _csv, io as _io
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["sku", "title", "category", "wholesale_price", "stock_quantity", "reorder_level", "weight_kg"])
+    for p in products:
+        w.writerow([p.sku, p.title, p.category, float(p.wholesale_price), p.stock_quantity, p.reorder_level, float(p.weight_kg)])
+    from fastapi.responses import Response as R
+    return R(content=buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="products.csv"'})
+
 # --- 12. SYSTEM & HEALTH ---
 @app.get("/", tags=["Health"])
 def health_check():
@@ -1207,7 +1309,7 @@ def get_exchange_rate(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get
         db.add(setting)
         db.commit()
         db.refresh(setting)
-    return {"status": "success", "zig_exchange_rate": float(setting.zig_exchange_rate)}
+    return {"status": "success", "zig_exchange_rate": float(setting.zig_exchange_rate), "tax_rate": float(setting.tax_rate)}
 
 @app.post("/settings/rate", tags=["Settings"])
 def update_exchange_rate(payload: RateUpdatePayload, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
