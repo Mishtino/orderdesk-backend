@@ -14,6 +14,9 @@ from urllib.parse import parse_qsl
 
 import jwt
 import requests
+import pyotp
+import qrcode
+import base64
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from fastapi import FastAPI, Depends, HTTPException, Response, UploadFile, File, Request
@@ -175,6 +178,8 @@ class SupplierUserModel(Base):
     password = Column(String, nullable=False)
     security_passkey = Column(String, unique=True, nullable=False, index=True)
     role = Column(String, nullable=False, default="ADMIN")
+    totp_secret = Column(String, nullable=True)
+    totp_enabled = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class BuyerUserModel(Base):
@@ -294,6 +299,25 @@ class SettingsModel(Base):
     organization_id = Column(String, primary_key=True)
     zig_exchange_rate = Column(Numeric(10, 4), default=Decimal("26.5000"))
     tax_rate = Column(Numeric(5, 2), default=Decimal("0.00"))
+    plan = Column(String, default="free")
+    max_products = Column(Integer, default=50)
+    max_orders_per_month = Column(Integer, default=100)
+    max_users = Column(Integer, default=3)
+    brand_name = Column(String, nullable=True)
+    brand_color = Column(String, default="#6366f1")
+
+class ApiKeyModel(Base):
+    __tablename__ = "api_keys"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    key_prefix = Column(String, nullable=False)
+    key_hash = Column(String, nullable=False)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_used_at = Column(DateTime, nullable=True)
+    revoked = Column(Boolean, default=False)
 
 Base.metadata.create_all(bind=engine)
 
@@ -474,6 +498,11 @@ def login_supplier(request: Request, payload: LoginPayload, response: Response, 
 
     if not verify_and_upgrade_password(user, payload.password, db):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    if user.totp_enabled:
+        now = datetime.now(timezone.utc)
+        temp = jwt.encode({"sub": user.id, "purpose": "2fa", "iat": now, "exp": now + timedelta(minutes=5)}, JWT_SECRET, algorithm=JWT_ALG)
+        return {"status": "2fa_required", "temp_token": temp}
 
     if not user.security_passkey:
         user.security_passkey = generate_unique_passkey()
@@ -999,6 +1028,7 @@ def _send_payment_reminder_email(order, org_name: str):
 
 @app.post("/orders", tags=["Orders"])
 def create_order(payload: OrderCreatePayload, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    enforce_limit(ctx, db, "order")
     subtotal = Decimal("0.00")
     for it in payload.items:
         subtotal += Decimal(str(it.unit_price)) * it.quantity
@@ -1218,6 +1248,7 @@ def list_users(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
 
 @app.post("/users", tags=["Users"])
 def create_user(payload: UserCreatePayload, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    enforce_limit(ctx, db, "user")
     require_role(ctx, {"ADMIN"})
     if db.query(SupplierUserModel).filter(SupplierUserModel.email == payload.email.strip().lower()).first():
         raise HTTPException(status_code=400, detail="An account with this email already exists.")
@@ -1320,3 +1351,204 @@ def update_exchange_rate(payload: RateUpdatePayload, ctx: Ctx = Depends(current_
     db.commit()
     db.refresh(setting)
     return {"status": "success", "zig_exchange_rate": float(setting.zig_exchange_rate), "tax_rate": float(setting.tax_rate)}
+# --- 11D. SAAS ESSENTIALS ---
+
+def _get_setting(org_id, db):
+    s = db.query(SettingsModel).filter(SettingsModel.organization_id == org_id).first()
+    if not s:
+        s = SettingsModel(organization_id=org_id)
+        db.add(s)
+        db.commit()
+        db.refresh(s)
+    return s
+
+# --- 2FA ---
+@app.post("/auth/2fa/setup", tags=["Auth"])
+def setup_2fa(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    user = db.query(SupplierUserModel).filter(SupplierUserModel.id == ctx.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    secret = pyotp.random_base32()
+    user.totp_secret = secret
+    user.totp_enabled = False
+    db.commit()
+    totp = pyotp.TOTP(secret)
+    uri = totp.provisioning_uri(name=user.email, issuer_name="OrderDesk")
+    img = qrcode.make(uri)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return {"secret": secret, "otpauth_uri": uri, "qr_png_base64": b64}
+
+class TwoFACode(BaseModel):
+    code: str
+
+@app.post("/auth/2fa/verify-setup", tags=["Auth"])
+def verify_setup_2fa(payload: TwoFACode, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    user = db.query(SupplierUserModel).filter(SupplierUserModel.id == ctx.user_id).first()
+    if not user or not user.totp_secret:
+        raise HTTPException(status_code=400, detail="Run setup first")
+    totp = pyotp.TOTP(user.totp_secret)
+    if not totp.verify(payload.code.strip(), valid_window=1):
+        raise HTTPException(status_code=400, detail="Invalid code")
+    user.totp_enabled = True
+    db.commit()
+    return {"status": "success", "message": "2FA enabled"}
+
+@app.post("/auth/2fa/disable", tags=["Auth"])
+def disable_2fa(payload: TwoFACode, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    user = db.query(SupplierUserModel).filter(SupplierUserModel.id == ctx.user_id).first()
+    if not user or not user.totp_enabled:
+        raise HTTPException(status_code=400, detail="2FA not enabled")
+    totp = pyotp.TOTP(user.totp_secret)
+    if not totp.verify(payload.code.strip(), valid_window=1):
+        raise HTTPException(status_code=400, detail="Invalid code")
+    user.totp_enabled = False
+    user.totp_secret = None
+    db.commit()
+    return {"status": "success", "message": "2FA disabled"}
+
+class TwoFALoginPayload(BaseModel):
+    temp_token: str
+    code: str
+
+@app.post("/auth/2fa/login", tags=["Auth"])
+def login_2fa(payload: TwoFALoginPayload, response: Response, db: Session = Depends(get_db)):
+    try:
+        data = jwt.decode(payload.temp_token, JWT_SECRET, algorithms=[JWT_ALG])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if data.get("purpose") != "2fa":
+        raise HTTPException(status_code=401, detail="Invalid token purpose")
+    user = db.query(SupplierUserModel).filter(SupplierUserModel.id == data.get("sub")).first()
+    if not user or not user.totp_enabled or not user.totp_secret:
+        raise HTTPException(status_code=401, detail="2FA not enabled")
+    totp = pyotp.TOTP(user.totp_secret)
+    if not totp.verify(payload.code.strip(), valid_window=1):
+        raise HTTPException(status_code=401, detail="Invalid 2FA code")
+    if not user.security_passkey:
+        user.security_passkey = generate_unique_passkey()
+        db.commit()
+    issue_session_cookie(response, user)
+    return {"status": "success", "organization_name": user.organization_name, "email": user.email}
+# --- API KEYS ---
+class ApiKeyCreate(BaseModel):
+    name: str
+
+@app.post("/api-keys", tags=["ApiKeys"])
+def create_api_key(payload: ApiKeyCreate, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    setting = _get_setting(ctx.org_id, db)
+    existing = db.query(ApiKeyModel).filter(ApiKeyModel.organization_id == ctx.org_id, ApiKeyModel.revoked == False).count()
+    limit = 5 if (setting.plan or "free") == "free" else 50
+    if existing >= limit:
+        raise HTTPException(status_code=403, detail=f"API key limit reached ({limit})")
+    raw = "odk_" + secrets.token_urlsafe(32)
+    prefix = raw[:12]
+    h = hashlib.sha256(raw.encode()).hexdigest()
+    key = ApiKeyModel(organization_id=ctx.org_id, name=payload.name.strip(), key_prefix=prefix, key_hash=h, created_by=ctx.user_id)
+    db.add(key)
+    db.commit()
+    db.refresh(key)
+    return {"id": key.id, "name": key.name, "key": raw, "key_prefix": prefix, "created_at": key.created_at}
+
+@app.get("/api-keys", tags=["ApiKeys"])
+def list_api_keys(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    keys = db.query(ApiKeyModel).filter(ApiKeyModel.organization_id == ctx.org_id).order_by(ApiKeyModel.created_at.desc()).all()
+    return {"data": [{"id": k.id, "name": k.name, "key_prefix": k.key_prefix, "created_at": k.created_at, "last_used_at": k.last_used_at, "revoked": k.revoked} for k in keys]}
+
+@app.delete("/api-keys/{key_id}", tags=["ApiKeys"])
+def revoke_api_key(key_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    key = db.query(ApiKeyModel).filter(ApiKeyModel.id == key_id, ApiKeyModel.organization_id == ctx.org_id).first()
+    if not key:
+        raise HTTPException(status_code=404, detail="Key not found")
+    key.revoked = True
+    db.commit()
+    return {"status": "success"}
+
+PLAN_LIMITS = {
+    "free": {"max_products": 50, "max_orders_per_month": 100, "max_users": 3},
+    "starter": {"max_products": 500, "max_orders_per_month": 1000, "max_users": 10},
+    "pro": {"max_products": 10000, "max_orders_per_month": 100000, "max_users": 100},
+}
+
+@app.get("/usage", tags=["Settings"])
+def get_usage(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    setting = _get_setting(ctx.org_id, db)
+    plan = setting.plan or "free"
+    limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+    products = db.query(ProductModel).filter(ProductModel.organization_id == ctx.org_id).count()
+    users = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).count()
+    now = datetime.utcnow()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    orders = db.query(OrderModel).filter(OrderModel.organization_id == ctx.org_id, OrderModel.created_at >= month_start).count()
+    return {
+        "plan": plan,
+        "limits": limits,
+        "usage": {"products": products, "orders_this_month": orders, "users": users},
+        "percent": {
+            "products": round(products / max(limits["max_products"], 1) * 100, 1),
+            "orders": round(orders / max(limits["max_orders_per_month"], 1) * 100, 1),
+            "users": round(users / max(limits["max_users"], 1) * 100, 1),
+        },
+    }
+
+@app.patch("/settings/plan", tags=["Settings"])
+def update_plan(payload: dict, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    plan = payload.get("plan")
+    if plan not in PLAN_LIMITS:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    setting = _get_setting(ctx.org_id, db)
+    setting.plan = plan
+    setting.max_products = PLAN_LIMITS[plan]["max_products"]
+    setting.max_orders_per_month = PLAN_LIMITS[plan]["max_orders_per_month"]
+    setting.max_users = PLAN_LIMITS[plan]["max_users"]
+    db.commit()
+    return {"status": "success", "plan": plan}
+
+# --- MULTI-TENANCY BRANDING ---
+class BrandingPayload(BaseModel):
+    brand_name: Optional[str] = None
+    brand_color: Optional[str] = None
+
+@app.get("/settings/branding", tags=["Settings"])
+def get_branding(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    s = _get_setting(ctx.org_id, db)
+    return {"brand_name": s.brand_name, "brand_color": s.brand_color or "#6366f1"}
+
+@app.patch("/settings/branding", tags=["Settings"])
+def update_branding(payload: BrandingPayload, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    s = _get_setting(ctx.org_id, db)
+    if payload.brand_name is not None:
+        s.brand_name = payload.brand_name
+    if payload.brand_color is not None:
+        s.brand_color = payload.brand_color
+    db.commit()
+    return {"status": "success", "brand_name": s.brand_name, "brand_color": s.brand_color}
+
+# --- ONBOARDING STATE ---
+@app.get("/onboarding", tags=["Settings"])
+def get_onboarding(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    products = db.query(ProductModel).filter(ProductModel.organization_id == ctx.org_id).count()
+    customers = db.query(CustomerModel).filter(CustomerModel.organization_id == ctx.org_id).count()
+    return {"has_products": products > 0, "has_customers": customers > 0, "products": products, "customers": customers}
+
+# --- PLAN ENFORCEMENT HELPERS (call from create endpoints) ---
+def enforce_limit(ctx, db, kind):
+    setting = _get_setting(ctx.org_id, db)
+    plan = setting.plan or "free"
+    limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+    if kind == "product":
+        c = db.query(ProductModel).filter(ProductModel.organization_id == ctx.org_id).count()
+        if c >= limits["max_products"]:
+            raise HTTPException(status_code=403, detail=f"Product limit reached for {plan} plan ({limits['max_products']})")
+    elif kind == "user":
+        c = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).count()
+        if c >= limits["max_users"]:
+            raise HTTPException(status_code=403, detail=f"User limit reached for {plan} plan ({limits['max_users']})")
+    elif kind == "order":
+        now = datetime.utcnow()
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        c = db.query(OrderModel).filter(OrderModel.organization_id == ctx.org_id, OrderModel.created_at >= month_start).count()
+        if c >= limits["max_orders_per_month"]:
+            raise HTTPException(status_code=403, detail=f"Monthly order limit reached for {plan} plan ({limits['max_orders_per_month']})")
+

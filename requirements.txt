@@ -11,3 +11,5 @@ pyjwt
 slowapi
 requests
 reportlab
+pyotp
+qrcode
