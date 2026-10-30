@@ -1311,9 +1311,12 @@ def update_exchange_rate(payload: RateUpdatePayload, ctx: Ctx = Depends(current_
     setting = db.query(SettingsModel).filter(SettingsModel.organization_id == ctx.org_id).first()
     rate_val = Decimal(str(payload.zig_exchange_rate))
     if not setting:
-        setting = SettingsModel(organization_id=ctx.org_id, zig_exchange_rate=rate_val)
+        setting = SettingsModel(organization_id=ctx.org_id, zig_exchange_rate=rate_val, tax_rate=Decimal(str(payload.tax_rate)) if payload.tax_rate is not None else Decimal("0.00"))
         db.add(setting)
     else:
         setting.zig_exchange_rate = rate_val
+        if payload.tax_rate is not None:
+            setting.tax_rate = Decimal(str(payload.tax_rate))
     db.commit()
-    return {"status": "success", "zig_exchange_rate": float(setting.zig_exchange_rate)}
+    db.refresh(setting)
+    return {"status": "success", "zig_exchange_rate": float(setting.zig_exchange_rate), "tax_rate": float(setting.tax_rate)}
