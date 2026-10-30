@@ -146,6 +146,14 @@ def current_ctx(request: Request, db: Session = Depends(get_db)) -> Ctx:
             token = auth_header.split(" ")[1]
     
     if not token:
+        api_key = request.headers.get("X-API-Key")
+        if api_key:
+            h = hashlib.sha256(api_key.encode()).hexdigest()
+            ak = db.query(ApiKeyModel).filter(ApiKeyModel.key_hash == h, ApiKeyModel.revoked == False).first()
+            if ak:
+                ak.last_used_at = datetime.utcnow()
+                db.commit()
+                return Ctx(user_id=ak.created_by or "", org_id=ak.organization_id, role="API")
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         claims = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
@@ -318,6 +326,18 @@ class ApiKeyModel(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used_at = Column(DateTime, nullable=True)
     revoked = Column(Boolean, default=False)
+
+class AuditLogModel(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(String, nullable=False, index=True)
+    user_id = Column(String, nullable=True)
+    action = Column(String, nullable=False)
+    entity = Column(String, nullable=False)
+    entity_id = Column(String, nullable=True)
+    detail = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
 
@@ -840,6 +860,7 @@ def update_order_status(order_id: str, payload: StatusUpdatePayload, ctx: Ctx = 
     _old = order.status
     order.status = payload.status.upper()
     db.add(OrderStatusHistoryModel(order_id=order.id, organization_id=ctx.org_id, from_status=_old, to_status=payload.status.upper(), changed_by=ctx.user_id, note="Status updated"))
+    audit(db, ctx, "status_change", "order", order.id, f"{_old}->{payload.status.upper()}")
     db.commit()
     return {"status": "success", "order_id": order.id, "new_status": order.status}
 
@@ -863,6 +884,7 @@ def ship_order(order_id: str, payload: ShipmentPayload, ctx: Ctx = Depends(curre
     order.status = "SHIPPED"
     order.shipped_at = datetime.utcnow()
     db.add(OrderStatusHistoryModel(order_id=order.id, organization_id=ctx.org_id, from_status=_old, to_status="SHIPPED", changed_by=ctx.user_id, note="Shipped"))
+    audit(db, ctx, "ship", "order", order.id, payload.tracking_number)
     db.commit()
     db.refresh(order)
     org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).first()
@@ -878,6 +900,7 @@ def deliver_order(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = 
     order.status = "DELIVERED"
     order.delivered_at = datetime.utcnow()
     db.add(OrderStatusHistoryModel(order_id=order.id, organization_id=ctx.org_id, from_status=_old, to_status="DELIVERED", changed_by=ctx.user_id, note="Delivered"))
+    audit(db, ctx, "deliver", "order", order.id, None)
     db.commit()
     db.refresh(order)
     org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).first()
@@ -1072,6 +1095,7 @@ def create_order(payload: OrderCreatePayload, ctx: Ctx = Depends(current_ctx), d
         ))
     db.commit()
     db.refresh(order)
+    audit(db, ctx, "create", "order", order.id, order.invoice_number)
     return {"status": "success", "data": order}
 
 @app.get("/orders/{order_id}/invoice", tags=["Orders"])
@@ -1269,6 +1293,7 @@ def create_user(payload: UserCreatePayload, ctx: Ctx = Depends(current_ctx), db:
     db.add(user)
     db.commit()
     db.refresh(user)
+    audit(db, ctx, "create", "user", user.id, user.email)
     return {"status": "success", "data": {"id": user.id, "email": user.email, "role": user.role}}
 
 @app.patch("/users/{user_id}/role", tags=["Users"])
@@ -1360,6 +1385,18 @@ def _get_setting(org_id, db):
         db.add(s)
         db.commit()
         db.refresh(s)
+def audit(db, ctx, action, entity, entity_id=None, detail=None):
+    try:
+        db.add(AuditLogModel(organization_id=ctx.org_id, user_id=ctx.user_id, action=action, entity=entity, entity_id=entity_id, detail=detail))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+@app.get("/audit-logs", tags=["Audit"])
+def list_audit_logs(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db), limit: int = 100):
+    rows = db.query(AuditLogModel).filter(AuditLogModel.organization_id == ctx.org_id).order_by(AuditLogModel.created_at.desc()).limit(limit).all()
+    return {"data": [{"id": r.id, "user_id": r.user_id, "action": r.action, "entity": r.entity, "entity_id": r.entity_id, "detail": r.detail, "created_at": r.created_at} for r in rows]}
+
     return s
 
 # --- 2FA ---
@@ -1449,6 +1486,7 @@ def create_api_key(payload: ApiKeyCreate, ctx: Ctx = Depends(current_ctx), db: S
     db.add(key)
     db.commit()
     db.refresh(key)
+    audit(db, ctx, "create", "api_key", key.id, key.name)
     return {"id": key.id, "name": key.name, "key": raw, "key_prefix": prefix, "created_at": key.created_at}
 
 @app.get("/api-keys", tags=["ApiKeys"])
