@@ -875,11 +875,6 @@ def add_order_note(order_id: str, payload: dict, ctx: Ctx = Depends(current_ctx)
     db.commit()
     db.refresh(note)
     return {"status": "success", "data": {"id": note.id, "note": note.note, "created_at": note.created_at}}
-    order = db.query(OrderModel).filter(OrderModel.id == order_id, OrderModel.organization_id == ctx.org_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-    rows = db.query(OrderStatusHistoryModel).filter(OrderStatusHistoryModel.order_id == order_id).order_by(OrderStatusHistoryModel.changed_at).all()
-    return {"data": [{"id": r.id, "from_status": r.from_status, "to_status": r.to_status, "changed_by": r.changed_by, "note": r.note, "changed_at": r.changed_at} for r in rows]}
 
 @app.get("/orders/{order_id}/history", tags=["Orders"])
 def order_history(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
