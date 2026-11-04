@@ -33,6 +33,7 @@ from paynow import Paynow
 
 # --- 0. CONFIGURATION & FAIL-SAFE ENVS ---
 JWT_SECRET = os.getenv("JWT_SECRET", "orderdesk-dev-secret-change-in-production-please")
+JWT_ALG = "HS256"
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://orderdesk-ui.vercel.app")
 SESSION_COOKIE = "od_session"
 SESSION_HOURS = 12
@@ -158,9 +159,13 @@ def current_ctx(request: Request, db: Session = Depends(get_db)) -> Ctx:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         claims = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        user = db.query(SupplierUserModel).filter(SupplierUserModel.id == claims["sub"]).first()
-        role = user.role if user else "ADMIN"
-        return Ctx(user_id=claims["sub"], org_id=claims["org"], role=role)
+        user = db.query(SupplierUserModel).filter(
+            SupplierUserModel.id == claims["sub"],
+            SupplierUserModel.organization_id == claims["org"],
+        ).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="User account is no longer active")
+        return Ctx(user_id=user.id, org_id=user.organization_id, role=user.role)
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Session expired or invalid")
 
@@ -410,7 +415,7 @@ app.add_middleware(
     allow_origins=[FRONTEND_ORIGIN, "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
 
 @app.exception_handler(RateLimitExceeded)
@@ -616,10 +621,18 @@ def current_buyer(request: Request, db: Session = Depends(get_db)):
 def buyer_register(payload: BuyerRegisterPayload, db: Session = Depends(get_db)):
     if db.query(BuyerUserModel).filter(BuyerUserModel.email == payload.email.strip().lower()).first():
         raise HTTPException(status_code=400, detail="An account with this email already exists.")
+    clean_email = payload.email.strip().lower()
+    customer = db.query(CustomerModel).filter(
+        CustomerModel.organization_id == payload.organization_id,
+        CustomerModel.contact_email == clean_email,
+    ).first()
+    if not customer:
+        raise HTTPException(status_code=403, detail="This email is not registered as a customer of the selected supplier.")
     buyer = BuyerUserModel(
-        organization_id=payload.organization_id,
-        company_name=payload.company_name.strip(),
-        email=payload.email.strip().lower(),
+        organization_id=customer.organization_id,
+        customer_id=customer.id,
+        company_name=customer.company_name,
+        email=clean_email,
         password=ph.hash(payload.password),
     )
     db.add(buyer)
@@ -658,14 +671,22 @@ def buyer_orders(buyer: BuyerUserModel = Depends(current_buyer), db: Session = D
 def buyer_create_order(payload: OrderCreatePayload, buyer: BuyerUserModel = Depends(current_buyer), db: Session = Depends(get_db)):
     payload.client_name = buyer.company_name
     payload.client_email = buyer.email
-    # reuse create_order logic by calling it directly
-    from fastapi import BackgroundTasks
-    # delegate
-    ctx = None
-    # Build order manually
+    # Resolve product details and prices from the supplier catalogue.
     subtotal = Decimal("0.00")
+    verified_items = []
     for it in payload.items:
-        subtotal += Decimal(str(it.unit_price)) * it.quantity
+        sku = it.sku.strip().upper()
+        product = db.query(ProductModel).filter(
+            ProductModel.organization_id == buyer.organization_id,
+            ProductModel.sku == sku,
+        ).first()
+        if not product:
+            raise HTTPException(status_code=400, detail=f"Unknown product SKU: {sku}")
+        if product.stock_quantity < it.quantity:
+            raise HTTPException(status_code=409, detail=f"Insufficient stock for SKU: {sku}")
+        unit_price = Decimal(str(product.wholesale_price)).quantize(Decimal("0.01"))
+        subtotal += unit_price * it.quantity
+        verified_items.append((product, unit_price, it.quantity))
     shipping = Decimal(str(payload.shipping_fee))
     total = subtotal + shipping
     order = OrderModel(
@@ -683,8 +704,12 @@ def buyer_create_order(payload: OrderCreatePayload, buyer: BuyerUserModel = Depe
     )
     db.add(order)
     db.flush()
-    for it in payload.items:
-        db.add(OrderItemModel(order_id=order.id, organization_id=buyer.organization_id, sku=it.sku.strip().upper(), title=it.title.strip(), quantity=it.quantity, unit_price=Decimal(str(it.unit_price)), line_total=Decimal(str(it.unit_price))*it.quantity))
+    for product, unit_price, quantity in verified_items:
+        db.add(OrderItemModel(
+            order_id=order.id, organization_id=buyer.organization_id,
+            sku=product.sku, title=product.title, quantity=quantity,
+            unit_price=unit_price, line_total=unit_price * quantity,
+        ))
     db.commit()
     db.refresh(order)
     org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == buyer.organization_id).first()
@@ -1399,6 +1424,8 @@ def _get_setting(org_id, db):
         db.add(s)
         db.commit()
         db.refresh(s)
+    return s
+
 def audit(db, ctx, action, entity, entity_id=None, detail=None):
     try:
         db.add(AuditLogModel(organization_id=ctx.org_id, user_id=ctx.user_id, action=action, entity=entity, entity_id=entity_id, detail=detail))
@@ -1408,7 +1435,10 @@ def audit(db, ctx, action, entity, entity_id=None, detail=None):
 
 @app.get("/audit-logs", tags=["Audit"])
 def list_audit_logs(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db), limit: int = 100):
-    rows = db.query(AuditLogModel).filter(AuditLogModel.organization_id == ctx.org_id).order_by(AuditLogModel.created_at.desc()).limit(limit).all()
+    safe_limit = max(1, min(limit, 500))
+    rows = db.query(AuditLogModel).filter(AuditLogModel.organization_id == ctx.org_id).order_by(AuditLogModel.created_at.desc()).limit(safe_limit).all()
+    return {"data": [{"id": r.id, "user_id": r.user_id, "action": r.action, "entity": r.entity, "entity_id": r.entity_id, "detail": r.detail, "created_at": r.created_at} for r in rows]}
+
 # --- WEBHOOKS ---
 import threading as _threading
 
@@ -1483,11 +1513,8 @@ def dispatch_webhooks(org_id, event, payload, db_factory=None):
                 _threading.Thread(target=_dispatch_one, args=(w.id, w.url, w.secret, event, payload), daemon=True).start()
         db.close()
     except Exception:
+        # Webhook delivery is best-effort; it must not fail an already-committed request.
         pass
-
-    return {"data": [{"id": r.id, "user_id": r.user_id, "action": r.action, "entity": r.entity, "entity_id": r.entity_id, "detail": r.detail, "created_at": r.created_at} for r in rows]}
-
-    return s
 
 # --- 2FA ---
 @app.post("/auth/2fa/setup", tags=["Auth"])
