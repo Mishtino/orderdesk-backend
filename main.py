@@ -35,6 +35,21 @@ from paynow import Paynow
 JWT_SECRET = os.getenv("JWT_SECRET", "orderdesk-dev-secret-change-in-production-please")
 JWT_ALG = "HS256"
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://orderdesk-ui.vercel.app")
+# Vercel production aliases used by the OrderDesk UI. Additional custom domains
+# can be supplied through FRONTEND_ORIGINS as a comma-separated allowlist.
+_DEFAULT_FRONTEND_ORIGINS = {
+    "https://orderdesk-ui.vercel.app",
+    "https://orderdesk-ui-vortex-technologies.vercel.app",
+    "https://orderdesk-ui-git-main-vortex-technologies.vercel.app",
+    "https://orderdesk-ui-ag2t.vercel.app",
+    "https://orderdesk-ui-ag2t-vortex-technologies.vercel.app",
+    "https://orderdesk-ui-ag2t-git-main-vortex-technologies.vercel.app",
+}
+FRONTEND_ORIGINS = sorted(
+    _DEFAULT_FRONTEND_ORIGINS
+    | {origin.strip().rstrip("/") for origin in os.getenv("FRONTEND_ORIGINS", "").split(",") if origin.strip()}
+    | {FRONTEND_ORIGIN.strip().rstrip("/")}
+)
 SESSION_COOKIE = "od_session"
 SESSION_HOURS = 12
 BUYER_COOKIE = "od_buyer_session"
@@ -413,7 +428,7 @@ app.state.limiter = limiter
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://localhost:3000"],
+    allow_origins=FRONTEND_ORIGINS + ["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
