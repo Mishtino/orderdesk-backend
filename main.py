@@ -304,6 +304,7 @@ class PaymentModel(Base):
     paynow_reference = Column(String, nullable=True)
     expected_amount = Column(Numeric(12, 2), nullable=False)
     status = Column(String, default="CREATED")
+    plan_tier = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     paid_at = Column(DateTime, nullable=True)
 
@@ -1138,16 +1139,38 @@ def create_order(payload: OrderCreatePayload, ctx: Ctx = Depends(current_ctx), d
     return {"status": "success", "data": order}
 
 @app.get("/orders/{order_id}/invoice", tags=["Orders"])
-def get_invoice(order_id: str, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+def get_invoice(order_id: str, request: Request, db: Session = Depends(get_db)):
+    buyer = None
+    try:
+        ctx = current_ctx(request, db)
+        org_id = ctx.org_id
+    except HTTPException:
+        buyer_token = request.cookies.get(BUYER_COOKIE)
+        if not buyer_token:
+            raise
+        try:
+            claims = jwt.decode(buyer_token, JWT_SECRET, algorithms=["HS256"])
+            if claims.get("type") != "buyer":
+                raise HTTPException(status_code=401, detail="Invalid buyer session")
+            buyer = db.query(BuyerUserModel).filter(
+                BuyerUserModel.id == claims.get("sub"),
+                BuyerUserModel.organization_id == claims.get("org"),
+            ).first()
+            if not buyer:
+                raise HTTPException(status_code=401, detail="Buyer session is no longer active")
+            org_id = buyer.organization_id
+        except jwt.PyJWTError:
+            raise HTTPException(status_code=401, detail="Buyer session expired or invalid")
+
     order = db.query(OrderModel).filter(
         OrderModel.id == order_id,
-        OrderModel.organization_id == ctx.org_id,
+        OrderModel.organization_id == org_id,
     ).first()
-    if not order:
+    if not order or (buyer and order.client_email.lower() != buyer.email.lower()):
         raise HTTPException(status_code=404, detail="Order not found")
 
     items = db.query(OrderItemModel).filter(OrderItemModel.order_id == order.id).all()
-    org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == ctx.org_id).first()
+    org = db.query(SupplierUserModel).filter(SupplierUserModel.organization_id == org_id).first()
 
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
@@ -1218,14 +1241,19 @@ def initiate_paynow_subscription(req: SubscribeRequest, ctx: Ctx = Depends(curre
     if not PAYNOW_INTEGRATION_ID or not PAYNOW_INTEGRATION_KEY:
         raise HTTPException(status_code=503, detail="Paynow is not configured for production. Set PAYNOW_INTEGRATION_ID and PAYNOW_INTEGRATION_KEY.")
 
-    amount = Decimal("49.00") if "MONTH" in req.plan_tier.upper() else Decimal("499.00")
+    tier = req.plan_tier.strip().upper()
+    if tier not in {"MONTHLY", "ANNUAL"}:
+        raise HTTPException(status_code=400, detail="Plan tier must be MONTHLY or ANNUAL")
+    target_plan = "starter" if tier == "MONTHLY" else "pro"
+    amount = Decimal("49.00") if tier == "MONTHLY" else Decimal("499.00")
     internal_ref = f"SUB-{uuid.uuid4().hex[:12].upper()}"
 
     payment = PaymentModel(
         organization_id=ctx.org_id,
         reference=internal_ref,
         expected_amount=amount,
-        status="CREATED"
+        status="CREATED",
+        plan_tier=target_plan,
     )
     db.add(payment)
     db.commit()
@@ -1295,6 +1323,13 @@ async def paynow_webhook(request: Request, db: Session = Depends(get_db)):
         payment.status = "PAID"
         payment.paid_at = datetime.utcnow()
         payment.paynow_reference = confirmed.get("paynowreference")
+        if payment.plan_tier in PLAN_LIMITS:
+            setting = _get_setting(payment.organization_id, db)
+            limits = PLAN_LIMITS[payment.plan_tier]
+            setting.plan = payment.plan_tier
+            setting.max_products = limits["max_products"]
+            setting.max_orders_per_month = limits["max_orders_per_month"]
+            setting.max_users = limits["max_users"]
         db.commit()
     elif status in {"cancelled", "refunded", "disputed"}:
         payment.status = "CANCELLED"
@@ -1649,9 +1684,12 @@ def get_usage(ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
 
 @app.patch("/settings/plan", tags=["Settings"])
 def update_plan(payload: dict, ctx: Ctx = Depends(current_ctx), db: Session = Depends(get_db)):
+    require_role(ctx, {"ADMIN"})
     plan = payload.get("plan")
     if plan not in PLAN_LIMITS:
         raise HTTPException(status_code=400, detail="Invalid plan")
+    if plan != "free":
+        raise HTTPException(status_code=403, detail="Paid plans can only be activated after a verified Paynow payment.")
     setting = _get_setting(ctx.org_id, db)
     setting.plan = plan
     setting.max_products = PLAN_LIMITS[plan]["max_products"]
